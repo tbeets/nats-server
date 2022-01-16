@@ -1,4 +1,4 @@
-// Copyright 2012-2021 The NATS Authors
+// Copyright 2012-2022 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -259,6 +259,8 @@ type Server struct {
 	rerrMu   sync.Mutex
 	rerrLast time.Time
 
+	connRateCounter *rateCounter
+
 	// If there is a system account configured, to still support the $G account,
 	// the server will create a fake user and add it to the list of users.
 	// Keep track of what that user name is for config reload purposes.
@@ -266,6 +268,16 @@ type Server struct {
 
 	// How often user logon fails due to the issuer account not being pinned.
 	pinnedAccFail uint64
+
+	// This is a central logger for IPQueues when the number of pending
+	// messages reaches a certain thresold (per queue)
+	ipqLog *srvIPQueueLogger
+}
+
+type srvIPQueueLogger struct {
+	ch   chan string
+	done chan struct{}
+	s    *Server
 }
 
 // For tracking JS nodes.
@@ -274,6 +286,8 @@ type nodeInfo struct {
 	cluster string
 	domain  string
 	id      string
+	cfg     *JetStreamConfig
+	stats   *JetStreamStats
 	offline bool
 	js      bool
 }
@@ -363,6 +377,10 @@ func NewServer(opts *Options) (*Server, error) {
 		httpReqStats: make(map[string]uint64), // Used to track HTTP requests
 	}
 
+	if opts.TLSRateLimit > 0 {
+		s.connRateCounter = newRateCounter(opts.tlsConfigOpts.RateLimit)
+	}
+
 	// Trusted root operator keys.
 	if !s.processTrustedKeys() {
 		return nil, fmt.Errorf("Error processing trusted operator keys")
@@ -384,9 +402,19 @@ func NewServer(opts *Options) (*Server, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Place ourselves in some lookup maps.
-	ourNode := string(getHash(serverName))
-	s.nodeToInfo.Store(ourNode, nodeInfo{serverName, opts.Cluster.Name, opts.JetStreamDomain, info.ID, false, opts.JetStream})
+	// Place ourselves in the JetStream nodeInfo if needed.
+	if opts.JetStream {
+		ourNode := string(getHash(serverName))
+		s.nodeToInfo.Store(ourNode, nodeInfo{
+			serverName,
+			opts.Cluster.Name,
+			opts.JetStreamDomain,
+			info.ID,
+			&JetStreamConfig{MaxMemory: opts.JetStreamMaxMemory, MaxStore: opts.JetStreamMaxStore},
+			nil,
+			false, true,
+		})
+	}
 
 	s.routeResolver = opts.Cluster.resolver
 	if s.routeResolver == nil {
@@ -501,6 +529,23 @@ func NewServer(opts *Options) (*Server, error) {
 	return s, nil
 }
 
+func (s *Server) logRejectedTLSConns() {
+	defer s.grWG.Done()
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.quitCh:
+			return
+		case <-t.C:
+			blocked := s.connRateCounter.countBlocked()
+			if blocked > 0 {
+				s.Warnf("Rejected %d connections due to TLS rate limiting", blocked)
+			}
+		}
+	}
+}
+
 // clusterName returns our cluster name which could be dynamic.
 func (s *Server) ClusterName() string {
 	s.mu.Lock()
@@ -558,6 +603,11 @@ func (s *Server) setClusterName(name string) {
 // Return whether the cluster name is dynamic.
 func (s *Server) isClusterNameDynamic() bool {
 	return s.getOpts().Cluster.Name == _EMPTY_
+}
+
+// Returns our configured serverName.
+func (s *Server) serverName() string {
+	return s.getOpts().ServerName
 }
 
 // ClientURL returns the URL used to connect clients. Helpful in testing
@@ -1146,9 +1196,6 @@ func (s *Server) SetDefaultSystemAccount() error {
 	return s.SetSystemAccount(DEFAULT_SYSTEM_ACCOUNT)
 }
 
-// For internal sends.
-const internalSendQLen = 256 * 1024
-
 // Assign a system account. Should only be called once.
 // This sets up a server to send and receive messages from
 // inside the server itself.
@@ -1188,7 +1235,7 @@ func (s *Server) setSystemAccount(acc *Account) error {
 		sid:     1,
 		servers: make(map[string]*serverUpdate),
 		replies: make(map[string]msgHandler),
-		sendq:   make(chan *pubMsg, internalSendQLen),
+		sendq:   newIPQueue(ipQueue_Logger("System send", s.ipqLog)), // of *pubMsg
 		resetCh: make(chan struct{}),
 		sq:      s.newSendQ(),
 		statsz:  eventsHBInterval,
@@ -1558,6 +1605,8 @@ func (s *Server) Start() {
 	s.grRunning = true
 	s.grMu.Unlock()
 
+	s.startIPQLogger()
+
 	// Pprof http endpoint for the profiler.
 	if opts.ProfPort != 0 {
 		s.StartProfiler()
@@ -1595,7 +1644,7 @@ func (s *Server) Start() {
 		s.checkResolvePreloads()
 	}
 
-	// Log the pid to a file
+	// Log the pid to a file.
 	if opts.PidFile != _EMPTY_ {
 		if err := s.logPid(); err != nil {
 			s.Fatalf("Could not write pidfile: %v", err)
@@ -1614,14 +1663,21 @@ func (s *Server) Start() {
 		s.SetDefaultSystemAccount()
 	}
 
-	// start up resolver machinery
+	// Start monitoring before enabling other subsystems of the
+	// server to be able to monitor during startup.
+	if err := s.StartMonitoring(); err != nil {
+		s.Fatalf("Can't start monitoring: %v", err)
+		return
+	}
+
+	// Start up resolver machinery.
 	if ar := s.AccountResolver(); ar != nil {
 		if err := ar.Start(s); err != nil {
 			s.Fatalf("Could not start resolver: %v", err)
 			return
 		}
 		// In operator mode, when the account resolver depends on an external system and
-		// the system account is the bootstrapping account, start fetching it
+		// the system account is the bootstrapping account, start fetching it.
 		if len(opts.TrustedOperators) == 1 && opts.SystemAccount != _EMPTY_ && opts.SystemAccount != DEFAULT_SYSTEM_ACCOUNT {
 			_, isMemResolver := ar.(*MemAccResolver)
 			if v, ok := s.accounts.Load(s.opts.SystemAccount); !isMemResolver && ok && v.(*Account).claimJWT == "" {
@@ -1709,12 +1765,6 @@ func (s *Server) Start() {
 	// Start OCSP Stapling monitoring for TLS certificates if enabled.
 	s.startOCSPMonitoring()
 
-	// Start monitoring if needed.
-	if err := s.StartMonitoring(); err != nil {
-		s.Fatalf("Can't start monitoring: %v", err)
-		return
-	}
-
 	// Start up gateway if needed. Do this before starting the routes, because
 	// we want to resolve the gateway host:port so that this information can
 	// be sent to other routes.
@@ -1768,6 +1818,10 @@ func (s *Server) Start() {
 
 	if opts.PortsFileDir != _EMPTY_ {
 		s.logPorts()
+	}
+
+	if opts.TLSRateLimit > 0 {
+		s.startGoRoutine(s.logRejectedTLSConns)
 	}
 
 	// Wait for clients.
@@ -1919,6 +1973,11 @@ func (s *Server) Shutdown() {
 	for doneExpected > 0 {
 		<-s.done
 		doneExpected--
+	}
+
+	// Stop the IPQueue logger (before the grWG.Wait() call)
+	if s.ipqLog != nil {
+		s.ipqLog.stop()
 	}
 
 	// Wait for go routines to be done.
@@ -2463,6 +2522,13 @@ func (s *Server) createClient(conn net.Conn) *client {
 
 	// Check for TLS
 	if !isClosed && tlsRequired {
+		if s.connRateCounter != nil && !s.connRateCounter.allow() {
+			c.mu.Unlock()
+			c.sendErr("Connection throttling is active. Please try again later.")
+			c.closeConnection(MaxConnectionsExceeded)
+			return nil
+		}
+
 		// If we have a prebuffer create a multi-reader.
 		if len(pre) > 0 {
 			c.nc = &tlsMixConn{c.nc, bytes.NewBuffer(pre)}
@@ -3551,4 +3617,36 @@ func (s *Server) updateRemoteSubscription(acc *Account, sub *subscription, delta
 	}
 
 	s.updateLeafNodes(acc, sub, delta)
+}
+
+func (s *Server) startIPQLogger() {
+	s.ipqLog = &srvIPQueueLogger{
+		ch:   make(chan string, 128),
+		done: make(chan struct{}),
+		s:    s,
+	}
+	s.startGoRoutine(s.ipqLog.run)
+}
+
+func (l *srvIPQueueLogger) stop() {
+	close(l.done)
+}
+
+func (l *srvIPQueueLogger) log(name string, pending int) {
+	select {
+	case l.ch <- fmt.Sprintf("%s queue pending size: %v", name, pending):
+	default:
+	}
+}
+
+func (l *srvIPQueueLogger) run() {
+	defer l.s.grWG.Done()
+	for {
+		select {
+		case w := <-l.ch:
+			l.s.Warnf("%s", w)
+		case <-l.done:
+			return
+		}
+	}
 }

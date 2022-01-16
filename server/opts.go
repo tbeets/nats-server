@@ -1,4 +1,4 @@
-// Copyright 2012-2021 The NATS Authors
+// Copyright 2012-2022 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -249,6 +249,7 @@ type Options struct {
 	TLSCaCert             string            `json:"-"`
 	TLSConfig             *tls.Config       `json:"-"`
 	TLSPinnedCerts        PinnedCertSet     `json:"-"`
+	TLSRateLimit          int64             `json:"-"`
 	AllowNonTLS           bool              `json:"-"`
 	WriteDeadline         time.Duration     `json:"-"`
 	MaxClosedClients      int               `json:"-"`
@@ -513,6 +514,7 @@ type TLSConfigOpts struct {
 	Map               bool
 	TLSCheckKnownURLs bool
 	Timeout           float64
+	RateLimit         int64
 	Ciphers           []uint16
 	CurvePreferences  []tls.CurveID
 	PinnedCerts       PinnedCertSet
@@ -902,6 +904,7 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 		o.TLSTimeout = tc.Timeout
 		o.TLSMap = tc.Map
 		o.TLSPinnedCerts = tc.PinnedCerts
+		o.TLSRateLimit = tc.RateLimit
 
 		// Need to keep track of path of the original TLS config
 		// and certs path for OCSP Stapling monitoring.
@@ -1601,7 +1604,7 @@ func parseGateway(v interface{}, o *Options, errors *[]error, warnings *[]error)
 	return nil
 }
 
-var dynamicJSAccountLimits = &JetStreamAccountLimits{-1, -1, -1, -1}
+var dynamicJSAccountLimits = &JetStreamAccountLimits{-1, -1, -1, -1, false}
 
 // Parses jetstream account limits for an account. Simple setup with boolen is allowed, and we will
 // use dynamic account limits.
@@ -1626,7 +1629,7 @@ func parseJetStreamForAccount(v interface{}, acc *Account, errors *[]error, warn
 			return &configErr{tk, fmt.Sprintf("Expected 'enabled' or 'disabled' for string value, got '%s'", vv)}
 		}
 	case map[string]interface{}:
-		jsLimits := &JetStreamAccountLimits{-1, -1, -1, -1}
+		jsLimits := &JetStreamAccountLimits{-1, -1, -1, -1, false}
 		for mk, mv := range vv {
 			tk, mv = unwrapValue(mv, &lt)
 			switch strings.ToLower(mk) {
@@ -1654,6 +1657,12 @@ func parseJetStreamForAccount(v interface{}, acc *Account, errors *[]error, warn
 					return &configErr{tk, fmt.Sprintf("Expected a parseable size for %q, got %v", mk, mv)}
 				}
 				jsLimits.MaxConsumers = int(vv)
+			case "max_bytes_required", "max_stream_bytes", "max_bytes":
+				vv, ok := mv.(bool)
+				if !ok {
+					return &configErr{tk, fmt.Sprintf("Expected a parseable bool for %q, got %v", mk, mv)}
+				}
+				jsLimits.MaxBytesRequired = bool(vv)
 			default:
 				if !tk.IsUsedVariable() {
 					err := &unknownConfigFieldErr{
@@ -1672,6 +1681,40 @@ func parseJetStreamForAccount(v interface{}, acc *Account, errors *[]error, warn
 		return &configErr{tk, fmt.Sprintf("Expected map, bool or string to define JetStream, got %T", v)}
 	}
 	return nil
+}
+
+// takes in a storage size as either an int or a string and returns an int64 value based on the input.
+func getStorageSize(v interface{}) (int64, error) {
+	_, ok := v.(int64)
+	if ok {
+		return v.(int64), nil
+	}
+
+	s, ok := v.(string)
+	if !ok {
+		return 0, fmt.Errorf("must be int64 or string")
+	}
+
+	if s == "" {
+		return 0, nil
+	}
+
+	suffix := s[len(s)-1:]
+	prefix := s[:len(s)-1]
+	num, err := strconv.ParseInt(prefix, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+
+	suffixMap := map[string]int64{"K": 10, "M": 20, "G": 30, "T": 40}
+
+	mult, ok := suffixMap[suffix]
+	if !ok {
+		return 0, fmt.Errorf("sizes defined as strings must end in K, M, G, T")
+	}
+	num *= 1 << mult
+
+	return num, nil
 }
 
 // Parse enablement of jetstream for a server.
@@ -1705,10 +1748,18 @@ func parseJetStream(v interface{}, opts *Options, errors *[]error, warnings *[]e
 				}
 				opts.StoreDir = mv.(string)
 			case "max_memory_store", "max_mem_store", "max_mem":
-				opts.JetStreamMaxMemory = mv.(int64)
+				s, err := getStorageSize(mv)
+				if err != nil {
+					return &configErr{tk, fmt.Sprintf("max_mem_store %s", err)}
+				}
+				opts.JetStreamMaxMemory = s
 				opts.maxMemSet = true
 			case "max_file_store", "max_file":
-				opts.JetStreamMaxStore = mv.(int64)
+				s, err := getStorageSize(mv)
+				if err != nil {
+					return &configErr{tk, fmt.Sprintf("max_file_store %s", err)}
+				}
+				opts.JetStreamMaxStore = s
 				opts.maxStoreSet = true
 			case "domain":
 				opts.JetStreamDomain = mv.(string)
@@ -3689,6 +3740,15 @@ func parseTLS(v interface{}, isClientCtx bool) (t *TLSConfigOpts, retErr error) 
 				return nil, &configErr{tk, "error parsing tls config, 'timeout' wrong type"}
 			}
 			tc.Timeout = at
+		case "connection_rate_limit":
+			at := int64(0)
+			switch mv := mv.(type) {
+			case int64:
+				at = mv
+			default:
+				return nil, &configErr{tk, "error parsing tls config, 'connection_rate_limit' wrong type"}
+			}
+			tc.RateLimit = at
 		case "pinned_certs":
 			ra, ok := mv.([]interface{})
 			if !ok {

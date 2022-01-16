@@ -3236,6 +3236,7 @@ func TestMaxSubTokens(t *testing.T) {
 
 	nc, err := nats.Connect(s.ClientURL())
 	require_NoError(t, err)
+	defer nc.Close()
 
 	errs := make(chan error, 1)
 
@@ -3255,4 +3256,33 @@ func TestMaxSubTokens(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Did not get the permissions error")
 	}
+}
+
+func TestGetStorageSize(t *testing.T) {
+	tt := []struct {
+		input string
+		want  int64
+		err   bool
+	}{
+		{"1K", 1024, false},
+		{"1M", 1048576, false},
+		{"1G", 1073741824, false},
+		{"1T", 1099511627776, false},
+		{"1L", 0, true},
+		{"TT", 0, true},
+		{"", 0, false},
+	}
+
+	for _, v := range tt {
+		var testErr bool
+		got, err := getStorageSize(v.input)
+		if err != nil {
+			testErr = true
+		}
+
+		if got != v.want || v.err != testErr {
+			t.Errorf("Got: %v, want %v with error: %v", got, v.want, testErr)
+		}
+	}
+
 }
