@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"math/rand"
@@ -10880,7 +10881,7 @@ func TestJetStreamConfigReloadWithGlobalAccount(t *testing.T) {
 	checkJSAccount()
 }
 
-// Test that we properly enfore per subject msg limits.
+// Test that we properly enforce per subject msg limits.
 func TestJetStreamMaxMsgsPerSubject(t *testing.T) {
 	const maxPer = 5
 	msc := StreamConfig{
@@ -11179,58 +11180,6 @@ func TestJetStreamLastSequenceBySubject(t *testing.T) {
 			pubAndCheck("kv.bar", "2", true)
 			pubAndCheck("kv.bar", "5", true)
 			pubAndCheck("kv.xxx", "5", false)
-		})
-	}
-}
-
-// https://github.com/nats-io/nats-server/issues/2314
-func TestJetStreamMaxMsgsPerAndDiscardNew(t *testing.T) {
-	for _, st := range []StorageType{FileStorage, MemoryStorage} {
-		t.Run(st.String(), func(t *testing.T) {
-			c := createJetStreamClusterExplicit(t, "JSC", 3)
-			defer c.shutdown()
-
-			nc, js := jsClientConnect(t, c.randomServer())
-			defer nc.Close()
-
-			cfg := StreamConfig{
-				Name:       "KV",
-				Subjects:   []string{"kv.>"},
-				Storage:    st,
-				Discard:    DiscardNew,
-				MaxMsgsPer: 1,
-				Replicas:   3,
-			}
-
-			req, err := json.Marshal(cfg)
-			if err != nil {
-				t.Fatalf("Unexpected error: %v", err)
-			}
-			// Do manually for now.
-			nc.Request(fmt.Sprintf(JSApiStreamCreateT, cfg.Name), req, time.Second)
-			si, err := js.StreamInfo("KV")
-			if err != nil {
-				t.Fatalf("Unexpected error: %v", err)
-			}
-			if si == nil || si.Config.Name != "KV" {
-				t.Fatalf("StreamInfo is not correct %+v", si)
-			}
-
-			js.Publish("kv.1", []byte("ok"))
-			js.Publish("kv.2", []byte("ok"))
-			js.Publish("kv.3", []byte("ok"))
-
-			if si, _ := js.StreamInfo("KV"); si == nil || si.State.Msgs != 3 {
-				t.Fatalf("Expected 3 messages, got %d", si.State.Msgs)
-			}
-			// This should fail.
-			if pa, err := js.Publish("kv.1", []byte("last")); err == nil {
-				t.Fatalf("Expected an error, got %+v and %v", pa, err)
-			}
-			// Make sure others work after the above failure.
-			if _, err := js.Publish("kv.22", []byte("favorite")); err != nil {
-				t.Fatalf("Unexpected error: %v", err)
-			}
 		})
 	}
 }
@@ -14499,6 +14448,245 @@ func TestJetStreamPullConsumersMultipleRequestsExpireOutOfOrder(t *testing.T) {
 	if expected := []string{"i.25", "i.75", "i.100", "i.200"}; !reflect.DeepEqual(rs, expected) {
 		t.Fatalf("Received in wrong order, wanted %+v, got %+v", expected, rs)
 	}
+}
+
+func TestJetStreamConsumerUpdateSurvival(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "X"})
+	require_NoError(t, err)
+
+	// First create a consumer that is push based.
+	_, err = js.AddConsumer("X", &nats.ConsumerConfig{Durable: "dlc", AckPolicy: nats.AckExplicitPolicy, MaxAckPending: 1024})
+	require_NoError(t, err)
+
+	// Now do same name but pull. This will update the MaxAcKPending
+	ci, err := js.AddConsumer("X", &nats.ConsumerConfig{Durable: "dlc", AckPolicy: nats.AckExplicitPolicy, MaxAckPending: 22})
+	require_NoError(t, err)
+
+	if ci.Config.MaxAckPending != 22 {
+		t.Fatalf("Expected MaxAckPending to be 22, got %d", ci.Config.MaxAckPending)
+	}
+
+	// Make sure this survives across a restart.
+	sd := s.JetStreamConfig().StoreDir
+	s.Shutdown()
+	// Restart.
+	s = RunJetStreamServerOnPort(-1, sd)
+	defer s.Shutdown()
+
+	nc, js = jsClientConnect(t, s)
+	defer nc.Close()
+
+	ci, err = js.ConsumerInfo("X", "dlc")
+	require_NoError(t, err)
+
+	if ci.Config.MaxAckPending != 22 {
+		t.Fatalf("Expected MaxAckPending to be 22, got %d", ci.Config.MaxAckPending)
+	}
+}
+
+func TestJetStreamNakRedeliveryWithNoWait(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	require_NoError(t, err)
+
+	_, err = js.Publish("foo", []byte("NAK"))
+	require_NoError(t, err)
+
+	ccReq := &CreateConsumerRequest{
+		Stream: "TEST",
+		Config: ConsumerConfig{
+			Durable:    "dlc",
+			AckPolicy:  AckExplicit,
+			MaxDeliver: 3,
+			AckWait:    time.Minute,
+			BackOff:    []time.Duration{5 * time.Second, 10 * time.Second},
+		},
+	}
+	// Do by hand for now until Go client catches up.
+	req, err := json.Marshal(ccReq)
+	require_NoError(t, err)
+	resp, err := nc.Request(fmt.Sprintf(JSApiDurableCreateT, "TEST", "dlc"), req, time.Second)
+	require_NoError(t, err)
+	var ccResp JSApiConsumerCreateResponse
+	err = json.Unmarshal(resp.Data, &ccResp)
+	require_NoError(t, err)
+	if ccResp.Error != nil {
+		t.Fatalf("Unexpected error: %+v", ccResp.Error)
+	}
+
+	rsubj := fmt.Sprintf(JSApiRequestNextT, "TEST", "dlc")
+	m, err := nc.Request(rsubj, nil, time.Second)
+	require_NoError(t, err)
+
+	// NAK this message.
+	delay, err := json.Marshal(&ConsumerNakOptions{Delay: 500 * time.Millisecond})
+	require_NoError(t, err)
+	dnak := []byte(fmt.Sprintf("%s  %s", AckNak, delay))
+	m.Respond(dnak)
+
+	// This message should come back to us after 500ms. If we do a one-shot request, with NoWait and Expires
+	// this will do the right thing and we get the message.
+	// What we want to test here is a true NoWait request with Expires==0 and eventually seeing the message be redelivered.
+	expires := time.Now().Add(time.Second)
+	for time.Now().Before(expires) {
+		m, err = nc.Request(rsubj, []byte(`{"batch":1, "no_wait": true}`), time.Second)
+		require_NoError(t, err)
+		if len(m.Data) > 0 {
+			// We got our message, so we are good.
+			return
+		}
+		// So we do not spin.
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("Did not get the message in time")
+}
+
+// Test that we properly enforce per subject msg limits when DiscardNew is set.
+// DiscardNew should only apply to stream limits, subject based limits should always be DiscardOld.
+func TestJetStreamMaxMsgsPerSubjectWithDiscardNew(t *testing.T) {
+	msc := StreamConfig{
+		Name:       "TEST",
+		Subjects:   []string{"foo", "bar", "baz", "x"},
+		Discard:    DiscardNew,
+		Storage:    MemoryStorage,
+		MaxMsgsPer: 4,
+		MaxMsgs:    10,
+		MaxBytes:   500,
+	}
+	fsc := msc
+	fsc.Storage = FileStorage
+
+	cases := []struct {
+		name    string
+		mconfig *StreamConfig
+	}{
+		{"MemoryStore", &msc},
+		{"FileStore", &fsc},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := RunBasicJetStreamServer()
+			defer s.Shutdown()
+
+			if config := s.JetStreamConfig(); config != nil {
+				defer removeDir(t, config.StoreDir)
+			}
+
+			mset, err := s.GlobalAccount().addStream(c.mconfig)
+			require_NoError(t, err)
+			defer mset.delete()
+
+			// Client for API requests.
+			nc, js := jsClientConnect(t, s)
+			defer nc.Close()
+
+			pubAndCheck := func(subj string, num int, expectedNumMsgs uint64) {
+				t.Helper()
+				for i := 0; i < num; i++ {
+					_, err = js.Publish(subj, []byte("TSLA"))
+					require_NoError(t, err)
+				}
+				si, err := js.StreamInfo("TEST")
+				require_NoError(t, err)
+				if si.State.Msgs != expectedNumMsgs {
+					t.Fatalf("Expected %d msgs, got %d", expectedNumMsgs, si.State.Msgs)
+				}
+			}
+
+			pubExpectErr := func(subj string, sz int) {
+				t.Helper()
+				_, err = js.Publish(subj, bytes.Repeat([]byte("X"), sz))
+				require_Error(t, err, errors.New("nats: maximum bytes exceeded"), errors.New("nats: maximum messages exceeded"))
+			}
+
+			pubAndCheck("foo", 1, 1)
+			// We should treat this as DiscardOld and only have 4 msgs after.
+			pubAndCheck("foo", 4, 4)
+			// Same thing here, shoud only have 4 foo and 4 bar for total of 8.
+			pubAndCheck("bar", 8, 8)
+			// We have 8 here, so only 2 left. If we add in a new subject when we have room it will be accepted.
+			pubAndCheck("baz", 2, 10)
+			// Now we are full, but makeup is foo-4 bar-4 baz-2.
+			// We can add to foo and bar since they are at their max and adding new ones there stays the same in terms of total of 10.
+			pubAndCheck("foo", 1, 10)
+			pubAndCheck("bar", 1, 10)
+			// Try to send a large message under an established subject that will exceed the 500 maximum.
+			// Even though we have a bar subject and its at its maximum, the message to be dropped is not big enough, so this should err.
+			pubExpectErr("bar", 300)
+			// Also even though we have room bytes wise, if we introduce a new subject this should fail too on msg limit exceeded.
+			pubExpectErr("x", 2)
+		})
+	}
+}
+
+// Issue #2836
+func TestJetStreamInterestRetentionBug(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"foo.>"},
+		Retention: nats.InterestPolicy,
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "c1", AckPolicy: nats.AckExplicitPolicy})
+	require_NoError(t, err)
+
+	test := func(token string, fseq, msgs uint64) {
+		t.Helper()
+		subj := fmt.Sprintf("foo.%s", token)
+		_, err = js.Publish(subj, nil)
+		require_NoError(t, err)
+		si, err := js.StreamInfo("TEST")
+		require_NoError(t, err)
+		if si.State.FirstSeq != fseq {
+			t.Fatalf("Expected first to be %d, got %d", fseq, si.State.FirstSeq)
+		}
+		if si.State.Msgs != msgs {
+			t.Fatalf("Expected msgs to be %d, got %d", msgs, si.State.Msgs)
+		}
+	}
+
+	test("bar", 1, 1)
+
+	// Create second filtered consumer.
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "c2", FilterSubject: "foo.foo", AckPolicy: nats.AckExplicitPolicy})
+	require_NoError(t, err)
+
+	test("bar", 1, 2)
+
 }
 
 ///////////////////////////////////////////////////////////////////////////

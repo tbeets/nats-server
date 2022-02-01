@@ -278,6 +278,74 @@ func TestJetStreamClusterMultiReplicaStreams(t *testing.T) {
 	}
 }
 
+func TestJetStreamClusterMultiReplicaStreamsDefaultFileMem(t *testing.T) {
+	const testConfig = `
+	listen: 127.0.0.1:-1
+	server_name: %s
+	jetstream: {store_dir: "%s"}
+
+	cluster {
+		name: %s
+		listen: 127.0.0.1:%d
+		routes = [%s]
+	}
+`
+	c := createJetStreamClusterWithTemplate(t, testConfig, "RNS", 3)
+	defer c.shutdown()
+
+	// Client based API
+	s := c.randomServer()
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo", "bar"},
+		Replicas: 3,
+		MaxBytes: 1024,
+	})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	// Send in 10 messages.
+	msg, toSend := []byte("Hello JS Clustering"), 10
+	for i := 0; i < toSend; i++ {
+		if _, err = js.Publish("foo", msg); err != nil {
+			t.Fatalf("Unexpected publish error: %v", err)
+		}
+	}
+
+	// Now grab info for this stream.
+	si, err := js.StreamInfo("TEST")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if si == nil || si.Config.Name != "TEST" {
+		t.Fatalf("StreamInfo is not correct %+v", si)
+	}
+	// Check active state as well, shows that the owner answered.
+	if si.State.Msgs != uint64(toSend) {
+		t.Fatalf("Expected %d msgs, got bad state: %+v", toSend, si.State)
+	}
+	// Now create a consumer. This should be affinitize to the same set of servers as the stream.
+	// First do a normal sub.
+	sub, err := js.SubscribeSync("foo")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	checkSubsPending(t, sub, toSend)
+
+	// Now create a consumer as well.
+	ci, err := js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "dlc", AckPolicy: nats.AckExplicitPolicy})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if ci == nil || ci.Name != "dlc" || ci.Stream != "TEST" || ci.NumPending != uint64(toSend) {
+		t.Fatalf("ConsumerInfo is not correct %+v", ci)
+	}
+}
+
 func TestJetStreamClusterMemoryStore(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3M", 3)
 	defer c.shutdown()
@@ -10277,9 +10345,15 @@ func TestJetStreamClusterRedeliverBackoffs(t *testing.T) {
 	_, err := js.AddStream(&nats.StreamConfig{
 		Name:     "TEST",
 		Replicas: 2,
-		Subjects: []string{"foo"},
+		Subjects: []string{"foo", "bar"},
 	})
 	require_NoError(t, err)
+
+	// Produce some messages on bar so that when we create the consumer
+	// on "foo", we don't have a 1:1 between consumer/stream sequence.
+	for i := 0; i < 10; i++ {
+		js.Publish("bar", []byte("msg"))
+	}
 
 	// Test when BackOff is configured and AckWait and MaxDeliver are as well.
 	// Currently the BackOff will override AckWait, but we want MaxDeliver to be set to be at least len(BackOff)+1.
@@ -10287,6 +10361,7 @@ func TestJetStreamClusterRedeliverBackoffs(t *testing.T) {
 		Stream: "TEST",
 		Config: ConsumerConfig{
 			Durable:        "dlc",
+			FilterSubject:  "foo",
 			DeliverSubject: "x",
 			AckPolicy:      AckExplicit,
 			AckWait:        30 * time.Second,
@@ -10358,6 +10433,36 @@ func TestJetStreamClusterRedeliverBackoffs(t *testing.T) {
 			t.Fatalf("Timing is off for %d, expected ~%v, but got %v", i, expected[i], d)
 		}
 	}
+}
+
+func TestJetStreamConsumerUpgrade(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+
+	c := createJetStreamClusterExplicit(t, "JSC", 3)
+	defer c.shutdown()
+
+	testUpdate := func(t *testing.T, s *Server) {
+		nc, js := jsClientConnect(t, s)
+		defer nc.Close()
+		_, err := js.AddStream(&nats.StreamConfig{Name: "X"})
+		require_NoError(t, err)
+		_, err = js.Publish("X", []byte("OK"))
+		require_NoError(t, err)
+		// First create a consumer that is push based.
+		_, err = js.AddConsumer("X", &nats.ConsumerConfig{Durable: "dlc", DeliverSubject: "Y"})
+		require_NoError(t, err)
+		// Now do same name but pull. This should be an error.
+		_, err = js.AddConsumer("X", &nats.ConsumerConfig{Durable: "dlc"})
+		require_Error(t, err)
+	}
+
+	t.Run("Single", func(t *testing.T) { testUpdate(t, s) })
+	t.Run("Clustered", func(t *testing.T) { testUpdate(t, c.randomServer()) })
 }
 
 // Support functions

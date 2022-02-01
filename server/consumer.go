@@ -1273,6 +1273,9 @@ func (acc *Account) checkNewConsumerConfig(cfg, ncfg *ConsumerConfig) error {
 		if cfg.DeliverSubject == _EMPTY_ {
 			return errors.New("can not update pull consumer to push based")
 		}
+		if ncfg.DeliverSubject == _EMPTY_ {
+			return errors.New("can not update push consumer to pull based")
+		}
 		rr := acc.sl.Match(cfg.DeliverSubject)
 		if len(rr.psubs)+len(rr.qsubs) != 0 {
 			return NewJSConsumerNameExistError()
@@ -1289,6 +1292,13 @@ func (o *consumer) updateConfig(cfg *ConsumerConfig) error {
 
 	if err := o.acc.checkNewConsumerConfig(&o.cfg, cfg); err != nil {
 		return err
+	}
+
+	if o.store != nil {
+		// Update local state always.
+		if err := o.store.UpdateConfig(cfg); err != nil {
+			return err
+		}
 	}
 
 	// DeliverSubject
@@ -2330,7 +2340,7 @@ func (o *consumer) processNextMsgReq(_ *subscription, c *client, _ *Account, _, 
 		o.outq.send(newJSPubMsg(reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
 	}
 
-	if o.isPushMode() {
+	if o.isPushMode() || o.waiting == nil {
 		sendErr(409, "Consumer is push based")
 		return
 	}
@@ -2364,7 +2374,7 @@ func (o *consumer) processNextMsgReq(_ *subscription, c *client, _ *Account, _, 
 
 	// If the request is for noWait and we have pending requests already, check if we have room.
 	if noWait {
-		msgsPending := o.adjustedPending()
+		msgsPending := o.adjustedPending() + uint64(len(o.rdq))
 		// If no pending at all, decide what to do with request.
 		// If no expires was set then fail.
 		if msgsPending == 0 && expires.IsZero() {
@@ -3120,7 +3130,7 @@ func (o *consumer) checkPending() {
 		}
 		elapsed, deadline := now-p.Timestamp, ttl
 		if len(o.cfg.BackOff) > 0 && o.rdc != nil {
-			dc := int(o.rdc[p.Sequence])
+			dc := int(o.rdc[seq])
 			if dc >= len(o.cfg.BackOff) {
 				dc = len(o.cfg.BackOff) - 1
 			}
