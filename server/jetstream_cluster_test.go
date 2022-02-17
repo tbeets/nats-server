@@ -1456,10 +1456,6 @@ func TestJetStreamClusterStreamExtendedUpdates(t *testing.T) {
 	if si := updateStream(); !reflect.DeepEqual(si.Config.Subjects, cfg.Subjects) {
 		t.Fatalf("Did not get expected stream info: %+v", si)
 	}
-	// Make sure these error for now.
-	// R factor changes
-	cfg.Replicas = 1
-	expectError()
 	// Mirror changes
 	cfg.Replicas = 3
 	cfg.Mirror = &nats.StreamSource{Name: "ORDERS"}
@@ -2949,25 +2945,17 @@ func TestJetStreamClusterUserSnapshotAndRestoreConfigChanges(t *testing.T) {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 
-	// Change name.
+	// Now change subjects.
 	ncfg := &StreamConfig{
-		Name:     "TEST2",
-		Subjects: []string{"foo"},
+		Name:     "TEST",
+		Subjects: []string{"bar", "baz"},
 		Storage:  FileStorage,
 		Replicas: 2,
 	}
-	if si := restore(ncfg, state, snap); si.Config.Name != "TEST2" {
-		t.Fatalf("Did not get expected stream info: %+v", si)
-	}
-	if err := js.DeleteStream("TEST2"); err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-	// Now change subjects.
-	ncfg.Subjects = []string{"bar", "baz"}
 	if si := restore(ncfg, state, snap); !reflect.DeepEqual(si.Config.Subjects, ncfg.Subjects) {
 		t.Fatalf("Did not get expected stream info: %+v", si)
 	}
-	if err := js.DeleteStream("TEST2"); err != nil {
+	if err := js.DeleteStream("TEST"); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 	// Storage
@@ -2975,7 +2963,7 @@ func TestJetStreamClusterUserSnapshotAndRestoreConfigChanges(t *testing.T) {
 	if si := restore(ncfg, state, snap); !reflect.DeepEqual(si.Config.Subjects, ncfg.Subjects) {
 		t.Fatalf("Did not get expected stream info: %+v", si)
 	}
-	if err := js.DeleteStream("TEST2"); err != nil {
+	if err := js.DeleteStream("TEST"); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 	// Now replicas
@@ -4686,7 +4674,7 @@ func TestJetStreamClusterSuperClusterCrossClusterConsumerInterest(t *testing.T) 
 
 func TestJetStreamNextReqFromMsg(t *testing.T) {
 	bef := time.Now()
-	expires, _, _, err := nextReqFromMsg([]byte(`{"expires":5000000000}`)) // nanoseconds
+	expires, _, _, _, _, err := nextReqFromMsg([]byte(`{"expires":5000000000}`)) // nanoseconds
 	require_NoError(t, err)
 	now := time.Now()
 	if expires.Before(bef.Add(5*time.Second)) || expires.After(now.Add(5*time.Second)) {
@@ -10463,6 +10451,289 @@ func TestJetStreamConsumerUpgrade(t *testing.T) {
 
 	t.Run("Single", func(t *testing.T) { testUpdate(t, s) })
 	t.Run("Clustered", func(t *testing.T) { testUpdate(t, c.randomServer()) })
+}
+
+func TestJetStreamAddConsumerWithInfo(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+
+	c := createJetStreamClusterExplicit(t, "JSC", 3)
+	defer c.shutdown()
+
+	testConsInfo := func(t *testing.T, s *Server) {
+		nc, js := jsClientConnect(t, s)
+		defer nc.Close()
+
+		_, err := js.AddStream(&nats.StreamConfig{
+			Name:     "TEST",
+			Subjects: []string{"foo"},
+		})
+		require_NoError(t, err)
+
+		for i := 0; i < 10; i++ {
+			_, err = js.Publish("foo", []byte("msg"))
+			require_NoError(t, err)
+		}
+
+		for i := 0; i < 100; i++ {
+			inbox := nats.NewInbox()
+			sub := natsSubSync(t, nc, inbox)
+
+			ci, err := js.AddConsumer("TEST", &nats.ConsumerConfig{
+				DeliverSubject: inbox,
+				DeliverPolicy:  nats.DeliverAllPolicy,
+				FilterSubject:  "foo",
+				AckPolicy:      nats.AckExplicitPolicy,
+			})
+			require_NoError(t, err)
+
+			if ci.NumPending != 10 {
+				t.Fatalf("Iter=%v - expected 10 messages pending on create, got %v", i+1, ci.NumPending)
+			}
+			js.DeleteConsumer("TEST", ci.Name)
+			sub.Unsubscribe()
+		}
+	}
+
+	t.Run("Single", func(t *testing.T) { testConsInfo(t, s) })
+	t.Run("Clustered", func(t *testing.T) { testConsInfo(t, c.randomServer()) })
+}
+
+func TestJetStreamClusterStreamReplicaUpdates(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R7S", 7)
+	defer c.shutdown()
+
+	// Client based API
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	// Start out at R1
+	cfg := &nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 1,
+	}
+	_, err := js.AddStream(cfg)
+	require_NoError(t, err)
+
+	numMsgs := 1000
+	for i := 0; i < numMsgs; i++ {
+		js.PublishAsync("foo", []byte("HELLO WORLD"))
+	}
+	select {
+	case <-js.PublishAsyncComplete():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Did not receive completion signal")
+	}
+
+	updateReplicas := func(r int) {
+		t.Helper()
+		si, err := js.StreamInfo("TEST")
+		require_NoError(t, err)
+		leader := si.Cluster.Leader
+
+		cfg.Replicas = r
+		_, err = js.UpdateStream(cfg)
+		require_NoError(t, err)
+		c.waitOnStreamLeader("$G", "TEST")
+
+		checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+			si, err = js.StreamInfo("TEST")
+			require_NoError(t, err)
+			if len(si.Cluster.Replicas) != r-1 {
+				return fmt.Errorf("Expected %d replicas, got %d", r-1, len(si.Cluster.Replicas))
+			}
+			return nil
+		})
+
+		// Make sure we kept same leader.
+		if si.Cluster.Leader != leader {
+			t.Fatalf("Leader changed, expected %q got %q", leader, si.Cluster.Leader)
+		}
+		// Make sure all are current.
+		for _, r := range si.Cluster.Replicas {
+			c.waitOnStreamCurrent(c.serverByName(r.Name), "$G", "TEST")
+		}
+		// Check msgs.
+		if si.State.Msgs != uint64(numMsgs) {
+			t.Fatalf("Expected %d msgs, got %d", numMsgs, si.State.Msgs)
+		}
+		// Make sure we have the right number of HA Assets running on the leader.
+		s := c.serverByName(leader)
+		jsi, err := s.Jsz(nil)
+		require_NoError(t, err)
+		nha := 1 // meta always present.
+		if len(si.Cluster.Replicas) > 0 {
+			nha++
+		}
+		if nha != jsi.HAAssets {
+			t.Fatalf("Expected %d HA asset(s), but got %d", nha, jsi.HAAssets)
+		}
+	}
+
+	// Update from 1-3
+	updateReplicas(3)
+	// Update from 3-5
+	updateReplicas(5)
+	// Update from 5-3
+	updateReplicas(3)
+	// Update from 3-1
+	updateReplicas(1)
+}
+
+func TestJetStreamClusterStreamTagPlacement(t *testing.T) {
+	sc := createJetStreamSuperCluster(t, 3, 4)
+	defer sc.shutdown()
+
+	reset := func(s *Server) {
+		s.mu.Lock()
+		s.sys.resetCh <- struct{}{}
+		s.mu.Unlock()
+		s.sendStatszUpdate()
+	}
+
+	// Make first cluster AWS, US country code.
+	for _, s := range sc.clusterForName("C1").servers {
+		opts := s.getOpts()
+		opts.Tags.Add("cloud:aws")
+		opts.Tags.Add("country:us")
+		reset(s)
+	}
+	// Make second cluster GCP, UK country code.
+	for _, s := range sc.clusterForName("C2").servers {
+		opts := s.getOpts()
+		opts.Tags.Add("cloud:gcp")
+		opts.Tags.Add("country:uk")
+		reset(s)
+	}
+	// Make third cluster AZ, JP country code.
+	for _, s := range sc.clusterForName("C3").servers {
+		opts := s.getOpts()
+		opts.Tags.Add("cloud:az")
+		opts.Tags.Add("country:jp")
+		reset(s)
+	}
+	// Make fourth cluster GCP, and SG country code.
+	for _, s := range sc.clusterForName("C4").servers {
+		opts := s.getOpts()
+		opts.Tags.Add("cloud:gcp")
+		opts.Tags.Add("country:sg")
+		reset(s)
+	}
+
+	placeOK := func(connectCluster string, tags []string, expectedCluster string) {
+		t.Helper()
+		nc, js := jsClientConnect(t, sc.clusterForName(connectCluster).randomServer())
+		defer nc.Close()
+		si, err := js.AddStream(&nats.StreamConfig{
+			Name:      "TEST",
+			Subjects:  []string{"foo"},
+			Placement: &nats.Placement{Tags: tags},
+		})
+		require_NoError(t, err)
+		if si.Cluster.Name != expectedCluster {
+			t.Fatalf("Failed to place properly in %q, got %q", expectedCluster, si.Cluster.Name)
+		}
+		js.DeleteStream("TEST")
+	}
+
+	placeOK("C2", []string{"cloud:aws"}, "C1")
+	placeOK("C2", []string{"country:jp"}, "C3")
+	placeOK("C1", []string{"cloud:gcp", "country:uk"}, "C2")
+	placeOK("C2", []string{"cloud:gcp", "country:sg"}, "C4")
+
+	// Case shoud not matter.
+	placeOK("C1", []string{"cloud:GCP", "country:UK"}, "C2")
+	placeOK("C2", []string{"Cloud:Gcp", "Country:Sg"}, "C4")
+
+	placeErr := func(connectCluster string, tags []string) {
+		t.Helper()
+		nc, js := jsClientConnect(t, sc.clusterForName(connectCluster).randomServer())
+		defer nc.Close()
+		_, err := js.AddStream(&nats.StreamConfig{
+			Name:      "TEST",
+			Subjects:  []string{"foo"},
+			Placement: &nats.Placement{Tags: tags},
+		})
+		require_Error(t, err, NewJSInsufficientResourcesError())
+	}
+
+	placeErr("C1", []string{"cloud:GCP", "country:US"})
+	placeErr("C1", []string{"country:DN"})
+	placeErr("C1", []string{"cloud:DO"})
+}
+
+func TestJetStreamClusterInterestRetentionWithFilteredConsumersExtra(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	subjectNameZero := "foo.bar"
+	subjectNameOne := "foo.baz"
+
+	// Client based API
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo.*"}, Retention: nats.InterestPolicy, Replicas: 3})
+	require_NoError(t, err)
+
+	checkState := func(expected uint64) {
+		t.Helper()
+		checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+			si, err := js.StreamInfo("TEST")
+			require_NoError(t, err)
+			if si.State.Msgs != expected {
+				return fmt.Errorf("Expected %d msgs, got %d", expected, si.State.Msgs)
+			}
+			return nil
+		})
+	}
+
+	subZero, err := js.PullSubscribe(subjectNameZero, "dlc-0")
+	require_NoError(t, err)
+
+	subOne, err := js.PullSubscribe(subjectNameOne, "dlc-1")
+	require_NoError(t, err)
+
+	msg := []byte("FILTERED")
+	// Now send a bunch of messages
+	for i := 0; i < 1000; i++ {
+		_, err = js.PublishAsync(subjectNameZero, msg)
+		require_NoError(t, err)
+		_, err = js.PublishAsync(subjectNameOne, msg)
+		require_NoError(t, err)
+	}
+
+	// should be 2000 in total
+	checkState(2000)
+
+	// fetch and acknowledge, count records to ensure no errors acknowledging
+	getAndAckBatch := func(sub *nats.Subscription) {
+		t.Helper()
+		successCounter := 0
+		msgs, err := sub.Fetch(1000)
+		require_NoError(t, err)
+
+		for _, m := range msgs {
+			err = m.Ack()
+			require_NoError(t, err)
+			successCounter++
+		}
+		if successCounter != 1000 {
+			t.Fatalf("Unexpected number of acknowledges %d for subscription %v", successCounter, sub)
+		}
+	}
+
+	// fetch records subscription zero
+	getAndAckBatch(subZero)
+	// fetch records for subscription one
+	getAndAckBatch(subOne)
+	// Make sure stream is zero.
+	checkState(0)
 }
 
 // Support functions

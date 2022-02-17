@@ -4512,11 +4512,56 @@ func TestJetStreamSnapshotsAPI(t *testing.T) {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 	if scResp.Error != nil {
-		t.Fatalf("Got an unexpected error from EOF omn restore: %+v", scResp.Error)
+		t.Fatalf("Got an unexpected error from EOF on restore: %+v", scResp.Error)
 	}
 
 	if !reflect.DeepEqual(scResp.StreamInfo.State, state) {
 		t.Fatalf("Did not match states, %+v vs %+v", scResp.StreamInfo.State, state)
+	}
+
+	// Now make sure that if we try to change the name/identity of the stream we get an error.
+	mset, err = acc.lookupStream(mname)
+	if err != nil {
+		t.Fatalf("Expected to find a stream for %q", mname)
+	}
+	state = mset.state()
+	mset.delete()
+
+	rreq.Config.Name = "NEW_STREAM"
+	req, _ = json.Marshal(rreq)
+
+	rmsg, err = nc.Request(fmt.Sprintf(JSApiStreamRestoreT, rreq.Config.Name), req, time.Second)
+	if err != nil {
+		t.Fatalf("Unexpected error on snapshot request: %v", err)
+	}
+	// Make sure to clear.
+	rresp.Error = nil
+	json.Unmarshal(rmsg.Data, &rresp)
+	// We should not get an error here.
+	if rresp.Error != nil {
+		t.Fatalf("Got an unexpected error response: %+v", rresp.Error)
+	}
+	for r := bytes.NewReader(snapshot); ; {
+		n, err := r.Read(chunk[:])
+		if err != nil {
+			break
+		}
+		nc.Request(rresp.DeliverSubject, chunk[:n], time.Second)
+	}
+
+	si, err = nc2.Request(rresp.DeliverSubject, nil, time.Second)
+	require_NoError(t, err)
+
+	scResp.Error = nil
+	if err := json.Unmarshal(si.Data, &scResp); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if scResp.Error == nil {
+		t.Fatalf("Expected an error but got none")
+	}
+	expect := "names do not match"
+	if !strings.Contains(scResp.Error.Description, expect) {
+		t.Fatalf("Expected description of %q, got %q", expect, scResp.Error.Description)
 	}
 }
 
@@ -4546,6 +4591,45 @@ func TestJetStreamPubAckPerf(t *testing.T) {
 	<-js.PublishAsyncComplete()
 	tt := time.Since(start)
 	fmt.Printf("time is %v\n", tt)
+	fmt.Printf("%.0f msgs/sec\n", float64(toSend)/tt.Seconds())
+}
+
+func TestJetStreamPubPerfWithFullStream(t *testing.T) {
+	// Comment out to run, holding place for now.
+	t.SkipNow()
+
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	toSend, msg := 1_000_000, []byte("OK")
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "foo", MaxMsgs: int64(toSend)})
+	require_NoError(t, err)
+
+	start := time.Now()
+	for i := 0; i < toSend; i++ {
+		js.PublishAsync("foo", msg)
+	}
+	<-js.PublishAsyncComplete()
+	tt := time.Since(start)
+	fmt.Printf("time is %v\n", tt)
+	fmt.Printf("%.0f msgs/sec\n", float64(toSend)/tt.Seconds())
+
+	// Now do same amount but knowing we are at our limit.
+	start = time.Now()
+	for i := 0; i < toSend; i++ {
+		js.PublishAsync("foo", msg)
+	}
+	<-js.PublishAsyncComplete()
+	tt = time.Since(start)
+	fmt.Printf("\ntime is %v\n", tt)
 	fmt.Printf("%.0f msgs/sec\n", float64(toSend)/tt.Seconds())
 }
 
@@ -7008,13 +7092,8 @@ type info struct {
 func TestJetStreamSimpleFileRecovery(t *testing.T) {
 	base := runtime.NumGoroutine()
 
-	s := RunRandClientPortServer()
+	s := RunBasicJetStreamServer()
 	defer s.Shutdown()
-
-	jsconfig := &JetStreamConfig{MaxMemory: 128 * 1024 * 1024, MaxStore: 32 * 1024 * 1024 * 1024}
-	if err := s.EnableJetStream(jsconfig); err != nil {
-		t.Fatalf("Expected no error, got %v", err)
-	}
 
 	if config := s.JetStreamConfig(); config != nil {
 		defer removeDir(t, config.StoreDir)
@@ -7047,7 +7126,6 @@ func TestJetStreamSimpleFileRecovery(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Unexpected error adding stream %q: %v", msetName, err)
 		}
-		defer mset.delete()
 
 		toSend := rand.Intn(100) + 1
 		for n := 1; n <= toSend; n++ {
@@ -7059,15 +7137,17 @@ func TestJetStreamSimpleFileRecovery(t *testing.T) {
 		numObs := rand.Intn(5) + 1
 		var obs []obsi
 		for n := 1; n <= numObs; n++ {
-			oname := fmt.Sprintf("WQ-%d", n)
+			oname := fmt.Sprintf("WQ-%d-%d", i, n)
 			o, err := mset.addConsumer(workerModeConfig(oname))
 			if err != nil {
 				t.Fatalf("Unexpected error: %v", err)
 			}
 			// Now grab some messages.
 			toReceive := rand.Intn(toSend) + 1
+			rsubj := o.requestNextMsgSubject()
 			for r := 0; r < toReceive; r++ {
-				resp, _ := nc.Request(o.requestNextMsgSubject(), nil, time.Second)
+				resp, err := nc.Request(rsubj, nil, time.Second)
+				require_NoError(t, err)
 				if resp != nil {
 					resp.Respond(nil)
 				}
@@ -7077,8 +7157,10 @@ func TestJetStreamSimpleFileRecovery(t *testing.T) {
 		ostate[msetName] = info{mset.config(), mset.state(), obs}
 	}
 	pusage := acc.JetStreamUsage()
+	nc.Flush()
 
 	// Shutdown and restart and make sure things come back.
+	sd := s.JetStreamConfig().StoreDir
 	s.Shutdown()
 
 	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
@@ -7089,12 +7171,8 @@ func TestJetStreamSimpleFileRecovery(t *testing.T) {
 		return nil
 	})
 
-	s = RunRandClientPortServer()
+	s = RunJetStreamServerOnPort(-1, sd)
 	defer s.Shutdown()
-
-	if err := s.EnableJetStream(jsconfig); err != nil {
-		t.Fatalf("Expected no error, got %v", err)
-	}
 
 	acc = s.GlobalAccount()
 
@@ -14903,6 +14981,232 @@ func TestJetStreamInterestRetentionBug(t *testing.T) {
 	require_NoError(t, err)
 
 	test("bar", 1, 2)
+}
+
+// Under load testing for K3S and the KINE interface we saw some stalls.
+// These were caused by a dynamic that would not send a second FC item with one
+// pending, but when we sent the next message and got blocked, if that msg would
+// exceed the outstanding FC we would become stalled.
+func TestJetStreamFlowControlStall(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "FC"})
+	require_NoError(t, err)
+
+	msg := []byte(strings.Repeat("X", 32768))
+	_, err = js.Publish("FC", msg)
+	require_NoError(t, err)
+
+	msg = []byte(strings.Repeat("X", 8*32768))
+	_, err = js.Publish("FC", msg)
+	require_NoError(t, err)
+	_, err = js.Publish("FC", msg)
+	require_NoError(t, err)
+
+	sub, err := js.SubscribeSync("FC", nats.OrderedConsumer())
+	require_NoError(t, err)
+
+	checkSubsPending(t, sub, 3)
+}
+
+func TestJetStreamConsumerPendingCountWithRedeliveries(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:    "test",
+		AckPolicy:  nats.AckExplicitPolicy,
+		AckWait:    50 * time.Millisecond,
+		MaxDeliver: 1,
+	})
+	require_NoError(t, err)
+
+	// Publish 1st message
+	_, err = js.Publish("foo", []byte("msg1"))
+	require_NoError(t, err)
+
+	sub, err := js.PullSubscribe("foo", "test")
+	require_NoError(t, err)
+	msgs, err := sub.Fetch(1)
+	require_NoError(t, err)
+	for _, m := range msgs {
+		require_Equal(t, string(m.Data), "msg1")
+		// Do not ack the message
+	}
+	// Check consumer info, pending should be 0
+	ci, err := js.ConsumerInfo("TEST", "test")
+	require_NoError(t, err)
+	if ci.NumPending != 0 {
+		t.Fatalf("Expected consumer info pending count to be 0, got %v", ci.NumPending)
+	}
+
+	// Wait for more than expiration
+	time.Sleep(100 * time.Millisecond)
+
+	// Publish 2nd message
+	_, err = js.Publish("foo", []byte("msg2"))
+	require_NoError(t, err)
+
+	msgs, err = sub.Fetch(1)
+	require_NoError(t, err)
+	for _, m := range msgs {
+		require_Equal(t, string(m.Data), "msg2")
+		// Its deliver count should be 1
+		meta, err := m.Metadata()
+		require_NoError(t, err)
+		if meta.NumDelivered != 1 {
+			t.Fatalf("Expected message's deliver count to be 1, got %v", meta.NumDelivered)
+		}
+	}
+	// Check consumer info, pending should be 0
+	ci, err = js.ConsumerInfo("TEST", "test")
+	require_NoError(t, err)
+	if ci.NumPending != 0 {
+		t.Fatalf("Expected consumer info pending count to be 0, got %v", ci.NumPending)
+	}
+}
+
+func TestJetStreamPullConsumerHeartBeats(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "T", Storage: nats.MemoryStorage})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("T", &nats.ConsumerConfig{Durable: "dlc", AckPolicy: nats.AckExplicitPolicy})
+	require_NoError(t, err)
+
+	rsubj := fmt.Sprintf(JSApiRequestNextT, "T", "dlc")
+
+	type tsMsg struct {
+		received time.Time
+		msg      *nats.Msg
+	}
+
+	doReq := func(batch int, hb, expires time.Duration, expected int) []*tsMsg {
+		t.Helper()
+		req := &JSApiConsumerGetNextRequest{Batch: batch, Expires: expires, Heartbeat: hb}
+		jreq, err := json.Marshal(req)
+		require_NoError(t, err)
+		reply := nats.NewInbox()
+		var msgs []*tsMsg
+		var mu sync.Mutex
+
+		sub, err := nc.Subscribe(reply, func(m *nats.Msg) {
+			mu.Lock()
+			msgs = append(msgs, &tsMsg{time.Now(), m})
+			mu.Unlock()
+		})
+		require_NoError(t, err)
+
+		err = nc.PublishRequest(rsubj, reply, jreq)
+		require_NoError(t, err)
+		checkFor(t, time.Second, 50*time.Millisecond, func() error {
+			mu.Lock()
+			nr := len(msgs)
+			mu.Unlock()
+			if nr >= expected {
+				return nil
+			}
+			return fmt.Errorf("Only have seen %d of %d responses", nr, expected)
+		})
+		sub.Unsubscribe()
+		return msgs
+	}
+
+	reqBad := nats.Header{"Status": []string{"400"}, "Description": []string{"Bad Request - heartbeat value too large"}}
+	expectErr := func(msgs []*tsMsg) {
+		t.Helper()
+		if len(msgs) != 1 {
+			t.Fatalf("Expected 1 msg, got %d", len(msgs))
+		}
+		if !reflect.DeepEqual(msgs[0].msg.Header, reqBad) {
+			t.Fatalf("Expected %+v hdr, got %+v", reqBad, msgs[0].msg.Header)
+		}
+	}
+
+	// Test errors first.
+	// Setting HB with no expires.
+	expectErr(doReq(1, 100*time.Millisecond, 0, 1))
+	// If HB larger than 50% of expires..
+	expectErr(doReq(1, 75*time.Millisecond, 100*time.Millisecond, 1))
+
+	reqTimeout := nats.Header{"Status": []string{"408"}, "Description": []string{"Request Timeout"}}
+	expectHBs := func(start time.Time, msgs []*tsMsg, expected int, hbi time.Duration) {
+		t.Helper()
+		if len(msgs) != expected {
+			t.Fatalf("Expected %d but got %d", expected, len(msgs))
+		}
+		// expected -1 should be all HBs.
+		for i, ts := 0, start; i < expected-1; i++ {
+			tr, m := msgs[i].received, msgs[i].msg
+			if m.Header.Get("Status") != "100" {
+				t.Fatalf("Expected a 100 status code, got %q", m.Header.Get("Status"))
+			}
+			if m.Header.Get("Description") != "Idle Heartbeat" {
+				t.Fatalf("Wrong description, got %q", m.Header.Get("Description"))
+			}
+			ts = ts.Add(hbi)
+			if tr.Before(ts) {
+				t.Fatalf("Received at wrong time: %v vs %v", tr, ts)
+			}
+		}
+		// Last msg should be timeout.
+		lm := msgs[len(msgs)-1].msg
+		if !reflect.DeepEqual(lm.Header, reqTimeout) {
+			t.Fatalf("Expected %+v hdr, got %+v", reqTimeout, lm.Header)
+		}
+	}
+
+	// These should work. Test idle first.
+	start, msgs := time.Now(), doReq(1, 50*time.Millisecond, 250*time.Millisecond, 5)
+	expectHBs(start, msgs, 5, 50*time.Millisecond)
+
+	// Now test that we do not send heartbeats while we receive traffic.
+	go func() {
+		for i := 0; i < 5; i++ {
+			time.Sleep(50 * time.Millisecond)
+			js.Publish("T", nil)
+		}
+	}()
+
+	start, msgs = time.Now(), doReq(10, 75*time.Millisecond, 350*time.Millisecond, 6)
+	// The first 5 should be msgs, no HBs.
+	for i := 0; i < 5; i++ {
+		if m := msgs[i].msg; len(m.Header) > 0 {
+			t.Fatalf("Got a potential heartbeat msg when we should not have: %+v", m.Header)
+		}
+	}
+	// Last should be timeout.
+	lm := msgs[len(msgs)-1].msg
+	if !reflect.DeepEqual(lm.Header, reqTimeout) {
+		t.Fatalf("Expected %+v hdr, got %+v", reqTimeout, lm.Header)
+	}
 }
 
 ///////////////////////////////////////////////////////////////////////////
