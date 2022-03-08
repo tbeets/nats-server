@@ -1102,13 +1102,22 @@ func (js *jetStream) setConsumerAssignmentRecovering(ca *consumerAssignment) {
 	}
 }
 
-// Just copied over and changes out the group so it can be encoded.
+// Just copies over and changes out the group so it can be encoded.
 // Lock should be held.
 func (sa *streamAssignment) copyGroup() *streamAssignment {
 	csa, cg := *sa, *sa.Group
 	csa.Group = &cg
 	csa.Group.Peers = copyStrings(sa.Group.Peers)
 	return &csa
+}
+
+// Just copies over and changes out the group so it can be encoded.
+// Lock should be held.
+func (ca *consumerAssignment) copyGroup() *consumerAssignment {
+	cca, cg := *ca, *ca.Group
+	cca.Group = &cg
+	cca.Group.Peers = copyStrings(ca.Group.Peers)
+	return &cca
 }
 
 // Lock should be held.
@@ -1150,10 +1159,10 @@ func (js *jetStream) processAddPeer(peer string) {
 				cc.meta.Propose(encodeAddStreamAssignment(csa))
 				for _, ca := range sa.consumers {
 					// Ephemerals are R=1, so only auto-remap durables, or R>1.
-					if ca.Config.Durable != _EMPTY_ {
-						cca := *ca
+					if ca.Config.Durable != _EMPTY_ || len(ca.Group.Peers) > 1 {
+						cca := ca.copyGroup()
 						cca.Group.Peers = csa.Group.Peers
-						cc.meta.Propose(encodeAddConsumerAssignment(&cca))
+						cc.meta.Propose(encodeAddConsumerAssignment(cca))
 					}
 				}
 			}
@@ -1235,9 +1244,9 @@ func (js *jetStream) removePeerFromStreamLocked(sa *streamAssignment, peer strin
 	for _, ca := range sa.consumers {
 		// Ephemerals are R=1, so only auto-remap durables, or R>1.
 		if ca.Config.Durable != _EMPTY_ {
-			cca := *ca
-			cca.Group.Peers = rg.Peers
-			cc.meta.Propose(encodeAddConsumerAssignment(&cca))
+			cca := ca.copyGroup()
+			cca.Group.Peers, cca.Group.Preferred = rg.Peers, _EMPTY_
+			cc.meta.Propose(encodeAddConsumerAssignment(cca))
 		} else if ca.Group.isMember(peer) {
 			// These are ephemerals. Check to see if we deleted this peer.
 			cc.meta.Propose(encodeDeleteConsumerAssignment(ca))
@@ -1297,7 +1306,7 @@ func (js *jetStream) applyMetaEntries(entries []*Entry, isRecovering bool) (bool
 			case assignConsumerOp:
 				ca, err := decodeConsumerAssignment(buf[1:])
 				if err != nil {
-					js.srv.Errorf("JetStream cluster failed to decode consumer assigment: %q", buf[1:])
+					js.srv.Errorf("JetStream cluster failed to decode consumer assignment: %q", buf[1:])
 					return didSnap, didRemove, err
 				}
 				if isRecovering {
@@ -1307,7 +1316,7 @@ func (js *jetStream) applyMetaEntries(entries []*Entry, isRecovering bool) (bool
 			case assignCompressedConsumerOp:
 				ca, err := decodeConsumerAssignmentCompressed(buf[1:])
 				if err != nil {
-					js.srv.Errorf("JetStream cluster failed to decode compressed consumer assigment: %q", buf[1:])
+					js.srv.Errorf("JetStream cluster failed to decode compressed consumer assignment: %q", buf[1:])
 					return didSnap, didRemove, err
 				}
 				if isRecovering {
@@ -1317,7 +1326,7 @@ func (js *jetStream) applyMetaEntries(entries []*Entry, isRecovering bool) (bool
 			case removeConsumerOp:
 				ca, err := decodeConsumerAssignment(buf[1:])
 				if err != nil {
-					js.srv.Errorf("JetStream cluster failed to decode consumer assigment: %q", buf[1:])
+					js.srv.Errorf("JetStream cluster failed to decode consumer assignment: %q", buf[1:])
 					return didSnap, didRemove, err
 				}
 				if isRecovering {
@@ -1476,14 +1485,14 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment) {
 	defer s.grWG.Done()
 
 	if n == nil {
-		s.Warnf("No RAFT group for '%s > %s", sa.Client.serviceAccount(), sa.Config.Name)
+		s.Warnf("No RAFT group for '%s > %s'", sa.Client.serviceAccount(), sa.Config.Name)
 		return
 	}
 
 	qch, lch, aq := n.QuitC(), n.LeadChangeC(), n.ApplyQ()
 
-	s.Debugf("Starting stream monitor for '%s > %s'", sa.Client.serviceAccount(), sa.Config.Name)
-	defer s.Debugf("Exiting stream monitor for '%s > %s'", sa.Client.serviceAccount(), sa.Config.Name)
+	s.Debugf("Starting stream monitor for '%s > %s' [%s]", sa.Client.serviceAccount(), sa.Config.Name, n.Group())
+	defer s.Debugf("Exiting stream monitor for '%s > %s' [%s]", sa.Client.serviceAccount(), sa.Config.Name, n.Group())
 
 	// Make sure we do not leave the apply channel to fill up and block the raft layer.
 	defer func() {
@@ -2194,6 +2203,9 @@ func (js *jetStream) processStreamAssignment(sa *streamAssignment) bool {
 		// Check if we have a raft node running, meaning we are no longer part of the group but were.
 		js.mu.Lock()
 		if node := sa.Group.node; node != nil {
+			if node.Leader() {
+				node.StepDown()
+			}
 			node.ProposeRemovePeer(ourID)
 			didRemove = true
 		}
@@ -2301,6 +2313,7 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 
 	mset, err := acc.lookupStream(sa.Config.Name)
 	if err == nil && mset != nil {
+		var needsSetLeader bool
 		if !alreadyRunning && numReplicas > 1 {
 			if needsNode {
 				js.createRaftGroup(rg, storage)
@@ -2309,6 +2322,10 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 		} else if numReplicas == 1 && alreadyRunning {
 			// We downgraded to R1. Make sure we cleanup the raft node and the stream monitor.
 			mset.removeNode()
+			// Make sure we are leader now that we are R1.
+			needsSetLeader = true
+			// In case we nned to shutdown the cluster specific subs, etc.
+			mset.setLeader(false)
 			js.mu.Lock()
 			sa.Group.node = nil
 			js.mu.Unlock()
@@ -2317,6 +2334,10 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 		if err = mset.update(sa.Config); err != nil {
 			s.Warnf("JetStream cluster error updating stream %q for account %q: %v", sa.Config.Name, acc.Name, err)
 			mset.setStreamAssignment(osa)
+		}
+		// Make sure we are the leader now that we are R1.
+		if needsSetLeader {
+			mset.setLeader(true)
 		}
 	}
 
@@ -2687,6 +2708,10 @@ func (js *jetStream) processConsumerAssignment(ca *consumerAssignment) {
 		sa.consumers = make(map[string]*consumerAssignment)
 	} else if oca := sa.consumers[ca.Name]; oca != nil {
 		wasExisting = true
+		// Copy over private existing state from former SA.
+		ca.Group.node = oca.Group.node
+		ca.responded = oca.responded
+		ca.err = oca.err
 	}
 
 	// Capture the optional state. We will pass it along if we are a member to apply.
@@ -2706,6 +2731,9 @@ func (js *jetStream) processConsumerAssignment(ca *consumerAssignment) {
 		// Check if we have a raft node running, meaning we are no longer part of the group but were.
 		js.mu.Lock()
 		if node := ca.Group.node; node != nil {
+			if node.Leader() {
+				node.StepDown()
+			}
 			node.ProposeRemovePeer(ourID)
 		}
 		ca.Group.node = nil
@@ -2873,7 +2901,19 @@ func (js *jetStream) processClusterCreateConsumer(ca *consumerAssignment, state 
 	} else {
 		if didCreate {
 			o.setCreatedTime(ca.Created)
+		} else {
+			// Check for scale down to 1..
+			if rg.node != nil && len(rg.Peers) == 1 {
+				o.clearNode()
+				o.setLeader(true)
+				// Need to clear from rg too.
+				js.mu.Lock()
+				rg.node = nil
+				js.mu.Unlock()
+				return
+			}
 		}
+
 		// Start our monitoring routine.
 		if rg.node == nil {
 			// Single replica consumer, process manually here.
@@ -3038,8 +3078,8 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 
 	qch, lch, aq := n.QuitC(), n.LeadChangeC(), n.ApplyQ()
 
-	s.Debugf("Starting consumer monitor for '%s > %s > %s", o.acc.Name, ca.Stream, ca.Name)
-	defer s.Debugf("Exiting consumer monitor for '%s > %s > %s'", o.acc.Name, ca.Stream, ca.Name)
+	s.Debugf("Starting consumer monitor for '%s > %s > %s' [%s]", o.acc.Name, ca.Stream, ca.Name, n.Group())
+	defer s.Debugf("Exiting consumer monitor for '%s > %s > %s' [%s]", o.acc.Name, ca.Stream, ca.Name, n.Group())
 
 	const (
 		compactInterval = 2 * time.Minute
@@ -3066,11 +3106,17 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 					lastSnap = snap
 				}
 			}
+		} else {
+			// If we are here we may have no state but may be processing updates as a filtered consumer.
+			// Make sure the store does not grow too much, so similar to memory logic above, just compact.
+			_, _, applied := n.Progress()
+			n.Compact(applied)
 		}
 	}
 
 	// Track if we are leader.
 	var isLeader bool
+	recovering := true
 
 	for {
 		select {
@@ -3083,6 +3129,7 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 			for _, cei := range ces {
 				// No special processing needed for when we are caught up on restart.
 				if cei == nil {
+					recovering = false
 					if n.NeedSnapshot() {
 						doSnapshot()
 					}
@@ -3101,7 +3148,7 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 			}
 			aq.recycle(&ces)
 		case isLeader = <-lch:
-			if !isLeader && n.GroupLeader() != noLeader {
+			if recovering && !isLeader {
 				js.setConsumerAssignmentRecovering(ca)
 			}
 			js.processConsumerLeaderChange(o, isLeader)
@@ -4001,6 +4048,8 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 
 	// Check for replica changes.
 	rg := osa.Group
+	var consumers []*consumerAssignment
+
 	if newCfg.Replicas != len(rg.Peers) {
 		// We are adding new peers here.
 		if newCfg.Replicas > len(rg.Peers) {
@@ -4011,18 +4060,45 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 				return
 			}
 			// Single nodes are not recorded by the NRG layer so we can rename.
-			if len(rg.Peers) == 1 {
+			if len(peers) == 1 {
 				rg.Name = groupNameForStream(peers, rg.Storage)
+			} else if len(rg.Peers) == 1 {
+				// This is scale up from being a singelton, set preferred to that singelton.
+				rg.Preferred = rg.Peers[0]
 			}
 			rg.Peers = peers
 		} else {
 			// We are deleting nodes here.
 			rg.Peers = rg.Peers[:newCfg.Replicas]
 		}
+
+		// Need to remap any consumers.
+		for _, ca := range osa.consumers {
+			// Ephemerals are R=1, so only auto-remap durables, or R>1.
+			numPeers := len(ca.Group.Peers)
+			if ca.Config.Durable != _EMPTY_ || numPeers > 1 {
+				cca := ca.copyGroup()
+				// Adjust preferred as needed.
+				if numPeers == 1 && len(rg.Peers) > 1 {
+					cca.Group.Preferred = ca.Group.Peers[0]
+				} else {
+					cca.Group.Preferred = _EMPTY_
+				}
+				// Assign new peers.
+				cca.Group.Peers = rg.Peers
+				// We can not propose here before the stream itself so we collect them.
+				consumers = append(consumers, cca)
+			}
+		}
 	}
 
 	sa := &streamAssignment{Group: rg, Sync: osa.Sync, Config: newCfg, Subject: subject, Reply: reply, Client: ci}
 	cc.meta.Propose(encodeUpdateStreamAssignment(sa))
+
+	// Process any staged consumers.
+	for _, ca := range consumers {
+		cc.meta.Propose(encodeAddConsumerAssignment(ca))
+	}
 }
 
 func (s *Server) jsClusteredStreamDeleteRequest(ci *ClientInfo, acc *Account, stream, subject, reply string, rmsg []byte) {
@@ -4250,7 +4326,7 @@ func (s *Server) jsClusteredStreamListRequest(acc *Account, ci *ClientInfo, filt
 	}()
 
 	var missingNames []string
-	sent := map[string]struct{}{}
+	sent := map[string]int{}
 	// Send out our requests here.
 	for _, sa := range streams {
 		if s.allPeersOffline(sa.Group) {
@@ -4261,7 +4337,7 @@ func (s *Server) jsClusteredStreamListRequest(acc *Account, ci *ClientInfo, filt
 		} else {
 			isubj := fmt.Sprintf(clusterStreamInfoT, sa.Client.serviceAccount(), sa.Config.Name)
 			s.sendInternalMsgLocked(isubj, inbox, nil, nil)
-			sent[sa.Config.Name] = struct{}{}
+			sent[sa.Config.Name] = len(sa.consumers)
 		}
 	}
 	// Don't hold lock.
@@ -4284,6 +4360,10 @@ LOOP:
 			resp.Missing = missingNames
 			break LOOP
 		case si := <-rc:
+			consCount := sent[si.Config.Name]
+			if consCount > 0 {
+				si.State.Consumers = consCount
+			}
 			delete(sent, si.Config.Name)
 			resp.Streams = append(resp.Streams, si)
 			// Check to see if we are done.
@@ -4887,9 +4967,14 @@ func (mset *stream) processClusteredInboundMsg(subject, reply string, hdr, msg [
 	mset.mu.RLock()
 	canRespond := !mset.cfg.NoAck && len(reply) > 0
 	name, stype := mset.cfg.Name, mset.cfg.Storage
-	s, js, jsa, st, rf, outq := mset.srv, mset.js, mset.jsa, mset.cfg.Storage, mset.cfg.Replicas, mset.outq
+	s, js, jsa, st, rf, outq, node := mset.srv, mset.js, mset.jsa, mset.cfg.Storage, mset.cfg.Replicas, mset.outq, mset.node
 	maxMsgSize, lseq := int(mset.cfg.MaxMsgSize), mset.lseq
 	mset.mu.RUnlock()
+
+	// This should not happen but possible now that we allow scale up, and scale down where this could trigger.
+	if node == nil {
+		return mset.processJetStreamMsg(subject, reply, hdr, msg, 0, 0)
+	}
 
 	// Check here pre-emptively if we have exceeded this server limits.
 	if js.limitsExceeded(stype) {
@@ -4974,7 +5059,7 @@ func (mset *stream) processClusteredInboundMsg(subject, reply string, hdr, msg [
 	mset.clseq++
 
 	// Do proposal.
-	err := mset.node.Propose(esm)
+	err := node.Propose(esm)
 	if err != nil && mset.clseq > 0 {
 		mset.clseq--
 	}

@@ -464,7 +464,9 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 		// Send advisory.
 		var suppress bool
 		if !s.standAloneMode() && sa == nil {
-			suppress = true
+			if cfg.Replicas > 1 {
+				suppress = true
+			}
 		} else if sa != nil {
 			suppress = sa.responded
 		}
@@ -1048,11 +1050,8 @@ func (mset *stream) update(config *StreamConfig) error {
 	// Now update config and store's version of our config.
 	mset.cfg = *cfg
 
-	var suppress bool
-	if mset.isClustered() && mset.sa != nil {
-		suppress = mset.sa.responded
-	}
-	if mset.isLeader() && !suppress {
+	// If we are the leader never suppres update advisory, simply send.
+	if mset.isLeader() {
 		mset.sendUpdateAdvisoryLocked()
 	}
 	mset.mu.Unlock()
@@ -1286,7 +1285,15 @@ func (mset *stream) sourceInfo(si *sourceInfo) *StreamSourceInfo {
 	if si == nil {
 		return nil
 	}
-	ssi := &StreamSourceInfo{Name: si.name, Lag: si.lag, Active: time.Since(si.last), Error: si.err}
+
+	ssi := &StreamSourceInfo{Name: si.name, Lag: si.lag, Error: si.err}
+	// If we have not heard from the source, set Active to -1.
+	if si.last.IsZero() {
+		ssi.Active = -1
+	} else {
+		ssi.Active = time.Since(si.last)
+	}
+
 	var ext *ExternalStream
 	if mset.cfg.Mirror != nil {
 		ext = mset.cfg.Mirror.External
@@ -3140,6 +3147,17 @@ func (mset *stream) setupSendCapabilities() {
 	go mset.internalLoop()
 }
 
+// Returns the associated account name.
+func (mset *stream) accName() string {
+	if mset == nil {
+		return _EMPTY_
+	}
+	mset.mu.RLock()
+	acc := mset.acc
+	mset.mu.RUnlock()
+	return acc.Name
+}
+
 // Name returns the stream name.
 func (mset *stream) name() string {
 	if mset == nil {
@@ -3167,7 +3185,6 @@ func (mset *stream) internalLoop() {
 	c.registerWithAccount(mset.acc)
 	defer c.closeConnection(ClientClosed)
 	outq, qch, msgs := mset.outq, mset.qch, mset.msgs
-	isClustered := mset.cfg.Replicas > 1
 
 	// For the ack msgs queue for interest retention.
 	var (
@@ -3223,6 +3240,11 @@ func (mset *stream) internalLoop() {
 			c.flushClients(0)
 			outq.recycle(&pms)
 		case <-msgs.ch:
+			// This can possibly change now so needs to be checked here.
+			mset.mu.RLock()
+			isClustered := mset.node != nil
+			mset.mu.RUnlock()
+
 			ims := msgs.pop()
 			for _, imi := range ims {
 				im := imi.(*inMsg)
@@ -3308,12 +3330,6 @@ func (mset *stream) stop(deleteFlag, advisory bool) error {
 		mset.infoSub = nil
 	}
 
-	// Quit channel.
-	if mset.qch != nil {
-		close(mset.qch)
-		mset.qch = nil
-	}
-
 	// Cluster cleanup
 	if n := mset.node; n != nil {
 		if deleteFlag {
@@ -3326,6 +3342,12 @@ func (mset *stream) stop(deleteFlag, advisory bool) error {
 	// Send stream delete advisory after the consumers.
 	if deleteFlag && advisory {
 		mset.sendDeleteAdvisoryLocked()
+	}
+
+	// Quit channel, do this after sending the delete advisory
+	if mset.qch != nil {
+		close(mset.qch)
+		mset.qch = nil
 	}
 
 	c := mset.client

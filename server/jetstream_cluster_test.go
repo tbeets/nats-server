@@ -4110,11 +4110,10 @@ func TestJetStreamClusterStreamRemovePeer(t *testing.T) {
 	for _, p := range si.Cluster.Replicas {
 		peers = append(peers, p.Name)
 	}
+	// Pick a truly random server to remove.
 	rand.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
 	toRemove := peers[0]
-	if cl := c.leader(); toRemove == cl.Name() {
-		toRemove = peers[1]
-	}
+
 	// First test bad peer.
 	req := &JSApiStreamRemovePeerRequest{Peer: "NOT VALID"}
 	jsreq, err := json.Marshal(req)
@@ -4140,6 +4139,7 @@ func TestJetStreamClusterStreamRemovePeer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
+
 	resp, err = nc.Request(fmt.Sprintf(JSApiStreamRemovePeerT, "TEST"), jsreq, time.Second)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
@@ -4150,6 +4150,8 @@ func TestJetStreamClusterStreamRemovePeer(t *testing.T) {
 	if rpResp.Error != nil {
 		t.Fatalf("Unexpected error: %+v", rpResp.Error)
 	}
+
+	c.waitOnStreamLeader("$G", "TEST")
 
 	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
 		si, err := js.StreamInfo("TEST", nats.MaxWait(time.Second))
@@ -10585,6 +10587,99 @@ func TestJetStreamClusterStreamReplicaUpdates(t *testing.T) {
 	updateReplicas(1)
 }
 
+func TestJetStreamClusterStreamReplicaUpdateFunctionCheck(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	// Client based API
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	// Start out at R3
+	cfg := &nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	}
+	_, err := js.AddStream(cfg)
+	require_NoError(t, err)
+
+	sub, err := js.SubscribeSync("foo", nats.Durable("cat"))
+	require_NoError(t, err)
+
+	numMsgs := 10
+	for i := 0; i < numMsgs; i++ {
+		_, err := js.Publish("foo", []byte("HELLO WORLD"))
+		require_NoError(t, err)
+	}
+	checkSubsPending(t, sub, numMsgs)
+
+	// Now ask leader to stepdown.
+	rmsg, err := nc.Request(fmt.Sprintf(JSApiStreamLeaderStepDownT, "TEST"), nil, time.Second)
+	require_NoError(t, err)
+
+	var sdResp JSApiStreamLeaderStepDownResponse
+	err = json.Unmarshal(rmsg.Data, &sdResp)
+	require_NoError(t, err)
+
+	if sdResp.Error != nil || !sdResp.Success {
+		t.Fatalf("Unexpected error: %+v", sdResp.Error)
+	}
+
+	c.waitOnStreamLeader("$G", "TEST")
+
+	updateReplicas := func(r int) {
+		t.Helper()
+		cfg.Replicas = r
+		_, err := js.UpdateStream(cfg)
+		require_NoError(t, err)
+		c.waitOnStreamLeader("$G", "TEST")
+		c.waitOnConsumerLeader("$G", "TEST", "cat")
+		ci, err := js.ConsumerInfo("TEST", "cat")
+		require_NoError(t, err)
+		if ci.Cluster.Leader == _EMPTY_ {
+			t.Fatalf("Expected a consumer leader but got none in consumer info")
+		}
+		if len(ci.Cluster.Replicas)+1 != r {
+			t.Fatalf("Expected consumer info to have %d peers, got %d", r, len(ci.Cluster.Replicas)+1)
+		}
+	}
+
+	// Scale down to 1.
+	updateReplicas(1)
+
+	// Make sure we can still send to the stream.
+	for i := 0; i < numMsgs; i++ {
+		_, err := js.Publish("foo", []byte("HELLO WORLD"))
+		require_NoError(t, err)
+	}
+
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+	if si.State.Msgs != uint64(2*numMsgs) {
+		t.Fatalf("Expected %d msgs, got %d", 3*numMsgs, si.State.Msgs)
+	}
+
+	checkSubsPending(t, sub, 2*numMsgs)
+
+	// Now back up.
+	updateReplicas(3)
+
+	// Send more.
+	for i := 0; i < numMsgs; i++ {
+		_, err := js.Publish("foo", []byte("HELLO WORLD"))
+		require_NoError(t, err)
+	}
+
+	si, err = js.StreamInfo("TEST")
+	require_NoError(t, err)
+	if si.State.Msgs != uint64(3*numMsgs) {
+		t.Fatalf("Expected %d msgs, got %d", 3*numMsgs, si.State.Msgs)
+	}
+
+	checkSubsPending(t, sub, 3*numMsgs)
+}
+
 func TestJetStreamClusterStreamTagPlacement(t *testing.T) {
 	sc := createJetStreamSuperCluster(t, 3, 4)
 	defer sc.shutdown()
@@ -10734,6 +10829,275 @@ func TestJetStreamClusterInterestRetentionWithFilteredConsumersExtra(t *testing.
 	getAndAckBatch(subOne)
 	// Make sure stream is zero.
 	checkState(0)
+}
+
+func TestJetStreamClusterStreamConsumersCount(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	sname := "TEST_STREAM_CONS_COUNT"
+	_, err := js.AddStream(&nats.StreamConfig{Name: sname, Subjects: []string{"foo"}, Replicas: 3})
+	require_NoError(t, err)
+
+	// Create some R1 consumers
+	for i := 0; i < 10; i++ {
+		inbox := nats.NewInbox()
+		natsSubSync(t, nc, inbox)
+		_, err = js.AddConsumer(sname, &nats.ConsumerConfig{DeliverSubject: inbox})
+		require_NoError(t, err)
+	}
+
+	// Now check that the consumer count in stream info/list is 10
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		// Check stream info
+		si, err := js.StreamInfo(sname)
+		if err != nil {
+			return fmt.Errorf("Error getting stream info: %v", err)
+		}
+		if n := si.State.Consumers; n != 10 {
+			return fmt.Errorf("From StreamInfo, expecting 10 consumers, got %v", n)
+		}
+
+		// Now from stream list
+		for si := range js.StreamsInfo() {
+			if n := si.State.Consumers; n != 10 {
+				return fmt.Errorf("From StreamsInfo, expecting 10 consumers, got %v", n)
+			}
+		}
+		return nil
+	})
+}
+
+func TestJetStreamClusterFilteredAndIdleConsumerNRGGrowth(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	sname := "TEST"
+	_, err := js.AddStream(&nats.StreamConfig{Name: sname, Subjects: []string{"foo.*"}, Replicas: 3})
+	require_NoError(t, err)
+
+	sub, err := js.SubscribeSync("foo.baz", nats.Durable("dlc"))
+	require_NoError(t, err)
+
+	for i := 0; i < 10_000; i++ {
+		js.PublishAsync("foo.bar", []byte("ok"))
+	}
+	select {
+	case <-js.PublishAsyncComplete():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Did not receive completion signal")
+	}
+
+	checkSubsPending(t, sub, 0)
+
+	// Grab consumer's underlying info and make sure NRG log not running away do to no-op skips on filtered consumer.
+	// Need a non-leader for the consumer, they are only ones getting skip ops to keep delivered updated.
+	cl := c.consumerLeader("$G", "TEST", "dlc")
+	var s *Server
+	for _, s = range c.servers {
+		if s != cl {
+			break
+		}
+	}
+
+	mset, err := s.GlobalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	o := mset.lookupConsumer("dlc")
+	if o == nil {
+		t.Fatalf("Error looking up consumer %q", "dlc")
+	}
+
+	// compactNumMin from monitorConsumer is 8192 atm.
+	const compactNumMin = 8192
+	if entries, _ := o.raftNode().Size(); entries > compactNumMin {
+		t.Fatalf("Expected <= %d entries, got %d", compactNumMin, entries)
+	}
+}
+
+func TestJetStreamClusterMirrorOrSourceNotActiveReporting(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}, Replicas: 3})
+	require_NoError(t, err)
+
+	si, err := js.AddStream(&nats.StreamConfig{
+		Name:   "M",
+		Mirror: &nats.StreamSource{Name: "TEST"},
+	})
+	require_NoError(t, err)
+
+	// We would previous calculate a large number if we actually never heard from the peer yet.
+	// We want to make sure if we have never heard from the other side report -1 as Active.
+	// It is possible if testing infra is slow that this could be legit, but should be pretty small.
+	if si.Mirror.Active != -1 && si.Mirror.Active > 10*time.Millisecond {
+		t.Fatalf("Expected an Active of -1, but got %v", si.Mirror.Active)
+	}
+}
+
+func TestJetStreamStreamAdvisories(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+
+	c := createJetStreamClusterExplicit(t, "JSC", 3)
+	defer c.shutdown()
+
+	checkAdv := func(t *testing.T, sub *nats.Subscription, expectedPrefixes ...string) {
+		t.Helper()
+		seen := make([]bool, len(expectedPrefixes))
+		for i := 0; i < len(expectedPrefixes); i++ {
+			msg := natsNexMsg(t, sub, time.Second)
+			var gotOne bool
+			for j, pfx := range expectedPrefixes {
+				if !seen[j] && strings.HasPrefix(msg.Subject, pfx) {
+					seen[j] = true
+					gotOne = true
+					break
+				}
+			}
+			if !gotOne {
+				t.Fatalf("Expected one of prefixes %q, got %q", expectedPrefixes, msg.Subject)
+			}
+		}
+	}
+
+	// Used to keep stream names pseudo unique. t.Name() has slashes in it which caused problems.
+	var testN int
+
+	checkAdvisories := func(t *testing.T, s *Server, replicas int) {
+
+		nc, js := jsClientConnect(t, s)
+		defer nc.Close()
+
+		testN++
+		streamName := "TEST_ADVISORIES_" + fmt.Sprintf("%d", testN)
+
+		sub := natsSubSync(t, nc, "$JS.EVENT.ADVISORY.STREAM.*."+streamName)
+
+		si, err := js.AddStream(&nats.StreamConfig{
+			Name:     streamName,
+			Storage:  nats.FileStorage,
+			Replicas: replicas,
+		})
+		require_NoError(t, err)
+		advisories := []string{JSAdvisoryStreamCreatedPre}
+		if replicas > 1 {
+			advisories = append(advisories, JSAdvisoryStreamLeaderElectedPre)
+		}
+		checkAdv(t, sub, advisories...)
+
+		si.Config.MaxMsgs = 1000
+		_, err = js.UpdateStream(&si.Config)
+		require_NoError(t, err)
+		checkAdv(t, sub, JSAdvisoryStreamUpdatedPre)
+
+		snapreq := &JSApiStreamSnapshotRequest{
+			DeliverSubject: nats.NewInbox(),
+			ChunkSize:      512,
+		}
+		var snapshot []byte
+		done := make(chan bool)
+		nc.Subscribe(snapreq.DeliverSubject, func(m *nats.Msg) {
+			// EOF
+			if len(m.Data) == 0 {
+				done <- true
+				return
+			}
+			// Could be writing to a file here too.
+			snapshot = append(snapshot, m.Data...)
+			// Flow ack
+			m.Respond(nil)
+		})
+
+		req, _ := json.Marshal(snapreq)
+		rmsg, err := nc.Request(fmt.Sprintf(JSApiStreamSnapshotT, streamName), req, time.Second)
+		if err != nil {
+			t.Fatalf("Unexpected error on snapshot request: %v", err)
+		}
+
+		var snapresp JSApiStreamSnapshotResponse
+		json.Unmarshal(rmsg.Data, &snapresp)
+		if snapresp.Error != nil {
+			t.Fatalf("Did not get correct error response: %+v", snapresp.Error)
+		}
+
+		// Wait to receive the snapshot.
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Did not receive our snapshot in time")
+		}
+
+		checkAdv(t, sub, JSAdvisoryStreamSnapshotCreatePre)
+		checkAdv(t, sub, JSAdvisoryStreamSnapshotCompletePre)
+
+		err = js.DeleteStream(streamName)
+		require_NoError(t, err)
+		checkAdv(t, sub, JSAdvisoryStreamDeletedPre)
+
+		state := *snapresp.State
+		config := *snapresp.Config
+		resreq := &JSApiStreamRestoreRequest{
+			Config: config,
+			State:  state,
+		}
+		req, _ = json.Marshal(resreq)
+		rmsg, err = nc.Request(fmt.Sprintf(JSApiStreamRestoreT, streamName), req, 5*time.Second)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		var resresp JSApiStreamRestoreResponse
+		json.Unmarshal(rmsg.Data, &resresp)
+		if resresp.Error != nil {
+			t.Fatalf("Got an unexpected error response: %+v", resresp.Error)
+		}
+
+		// Send our snapshot back in to restore the stream.
+		// Can be any size message.
+		var chunk [1024]byte
+		for r := bytes.NewReader(snapshot); ; {
+			n, err := r.Read(chunk[:])
+			if err != nil {
+				break
+			}
+			nc.Request(resresp.DeliverSubject, chunk[:n], time.Second)
+		}
+		rmsg, err = nc.Request(resresp.DeliverSubject, nil, time.Second)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		resresp.Error = nil
+		json.Unmarshal(rmsg.Data, &resresp)
+		if resresp.Error != nil {
+			t.Fatalf("Got an unexpected error response: %+v", resresp.Error)
+		}
+
+		checkAdv(t, sub, JSAdvisoryStreamRestoreCreatePre)
+		// At this point, the stream_created advisory may be sent before
+		// or after the restore_complete advisory because they are sent
+		// using different "send queues". That is, the restore uses the
+		// server's event queue while the stream_created is sent from
+		// the stream's own send queue.
+		advisories = append(advisories, JSAdvisoryStreamRestoreCompletePre)
+		checkAdv(t, sub, advisories...)
+	}
+
+	t.Run("Single", func(t *testing.T) { checkAdvisories(t, s, 1) })
+	t.Run("Clustered_R1", func(t *testing.T) { checkAdvisories(t, c.randomServer(), 1) })
+	t.Run("Clustered_R3", func(t *testing.T) { checkAdvisories(t, c.randomServer(), 3) })
 }
 
 // Support functions
