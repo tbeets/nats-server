@@ -2535,7 +2535,7 @@ func TestLeafNodeOperatorBadCfg(t *testing.T) {
 		system_account: %s
 		resolver: {
 			type: cache
-			dir: %s
+			dir: '%s'
 		}
 		leafnodes: {
 			%s
@@ -3835,7 +3835,7 @@ func TestLeafNodeUniqueServerNameCrossJSDomain(t *testing.T) {
 		jetstream {
 			max_mem_store: 256MB,
 			max_file_store: 2GB,
-			store_dir: "%s",
+			store_dir: '%s',
 			domain: hub
 		}
 		accounts {
@@ -3852,7 +3852,7 @@ func TestLeafNodeUniqueServerNameCrossJSDomain(t *testing.T) {
 		jetstream {
 			max_mem_store: 256MB,
 			max_file_store: 2GB,
-			store_dir: "%s",
+			store_dir: '%s',
 			domain: %s
 		}
 		accounts {
@@ -3944,7 +3944,7 @@ leafnodes: {
 }
 jetstream :{
     domain: "cluster"
-    store_dir: "%s"
+    store_dir: '%s'
     max_mem: 100Mb
     max_file: 100Mb
 }
@@ -3959,13 +3959,13 @@ accounts :{
 system_account = SYS
 jetstream: {
     domain: ln1
-    store_dir: %s
+    store_dir: '%s'
     max_mem: 50Mb
     max_file: 50Mb
 }
 leafnodes:{
-    remotes:[{ url:nats://127.0.0.1:%d, account: A, credentials: %s},
-			 { url:nats://127.0.0.1:%d, account: SYS, credentials: %s}]
+    remotes:[{ url:nats://127.0.0.1:%d, account: A, credentials: '%s'},
+			 { url:nats://127.0.0.1:%d, account: SYS, credentials: '%s'}]
 }
 `
 
@@ -4139,7 +4139,7 @@ leafnodes: {
 }
 jetstream :{
     domain: "cluster"
-    store_dir: "%s"
+    store_dir: '%s'
     max_mem: 100Mb
     max_file: 100Mb
 }
@@ -4168,7 +4168,7 @@ leafnodes: {
 }
 jetstream: {
     domain: "cluster"
-    store_dir: "%s"
+    store_dir: '%s'
     max_mem: 100Mb
     max_file: 100Mb
 }
@@ -4190,7 +4190,7 @@ accounts :{
 system_account = SYS
 jetstream: {
     domain: "cluster"
-    store_dir: %s
+    store_dir: '%s'
     max_mem: 50Mb
     max_file: 50Mb
 	%s
@@ -4218,7 +4218,7 @@ accounts :{
 system_account = SYS
 jetstream: {
     domain: "cluster"
-    store_dir: %s
+    store_dir: '%s'
     max_mem: 50Mb
     max_file: 50Mb
 	%s
@@ -4420,7 +4420,7 @@ leafnodes: {
 		timeout: 0.5
 	}
 }
-jetstream: { %s store_dir: %s; max_mem: 50Mb, max_file: 50Mb }
+jetstream: { %s store_dir: '%s'; max_mem: 50Mb, max_file: 50Mb }
 server_name: A
 cluster: {
 	name: clust1
@@ -4444,7 +4444,7 @@ leafnodes: {
 		timeout: 0.5
 	}
 }
-jetstream: { %s store_dir: %s; max_mem: 50Mb, max_file: 50Mb }
+jetstream: { %s store_dir: '%s'; max_mem: 50Mb, max_file: 50Mb }
 server_name: B
 cluster: {
 	name: clust1
@@ -4489,7 +4489,7 @@ accounts :{
 }
 system_account = SYS
 # the extension hint is to simplify this test. without it present we would need a cluster of size 2
-jetstream: { %s store_dir: %s; max_mem: 50Mb, max_file: 50Mb, extension_hint: will_extend }
+jetstream: { %s store_dir: '%s'; max_mem: 50Mb, max_file: 50Mb, extension_hint: will_extend }
 server_name: LA
 leafnodes:{
 	no_advertise: true
@@ -4599,13 +4599,13 @@ accounts :{
 system_account = SYS
 jetstream: {
     domain: "cluster"
-    store_dir: %s
+    store_dir: '%s'
     max_mem: 50Mb
     max_file: 50Mb
 }
 leafnodes:{
-    remotes:[{url:nats://a1:a1@127.0.0.1:50555, account: A, credentials: %s },
-		     {url:nats://s1:s1@127.0.0.1:50555, account: SYS, credentials: %s, deny_imports: foo, deny_exports: bar}]
+    remotes:[{url:nats://a1:a1@127.0.0.1:50555, account: A, credentials: '%s' },
+		     {url:nats://s1:s1@127.0.0.1:50555, account: SYS, credentials: '%s', deny_imports: foo, deny_exports: bar}]
 }
 `
 	akp, err := nkeys.CreateAccount()
@@ -4681,7 +4681,7 @@ accounts :{
     SYS:{ users:[ {user:s1,password:s1}]},
 }
 system_account: SYS
-jetstream: { domain: "%s", store_dir: "%s", max_mem: 100Mb, max_file: 100Mb }
+jetstream: { domain: "%s", store_dir: '%s', max_mem: 100Mb, max_file: 100Mb }
 server_name: LEAF
 leafnodes: {
     remotes:[{url:nats://a1:a1@127.0.0.1:%d, account: A},%s]
@@ -4751,7 +4751,7 @@ leafnodes: {
 		// Enable jetstream in hub.
 		sdHub := createDir(t, JetStreamStoreDir)
 		defer os.RemoveAll(sdHub)
-		jsEnabled := fmt.Sprintf(`{ domain: "%s", store_dir: "%s", max_mem: 100Mb, max_file: 100Mb }`, domain, sdHub)
+		jsEnabled := fmt.Sprintf(`{ domain: "%s", store_dir: '%s', max_mem: 100Mb, max_file: 100Mb }`, domain, sdHub)
 		require_NoError(t, ioutil.WriteFile(confHub, []byte(fmt.Sprintf(tmplHub,
 			sHubUpd1.opts.Port,
 			"disabled",
@@ -4833,11 +4833,11 @@ accounts :{
     SYS:{ users:[ {user:s1,password:s1}]},
 }
 system_account: SYS
-jetstream: { domain: "%s", store_dir: "%s", max_mem: 100Mb, max_file: 100Mb }
+jetstream: { domain: "%s", store_dir: '%s', max_mem: 100Mb, max_file: 100Mb }
 server_name: LEAF
 leafnodes: {
-    remotes:[{url:nats://127.0.0.1:%d, account: A, credentials: %s},
-		     {url:nats://127.0.0.1:%d, account: SYS, credentials: %s}]
+    remotes:[{url:nats://127.0.0.1:%d, account: A, credentials: '%s'},
+		     {url:nats://127.0.0.1:%d, account: SYS, credentials: '%s'}]
 }
 %s
 `
@@ -4922,7 +4922,7 @@ accounts :{
     A:{ jetstream: enabled, users:[ {user:a1,password:a1}]},
 	B:{ jetstream: enabled, users:[ {user:b1,password:b1}]}
 }
-jetstream : { domain: "DHUB", store_dir: "%s", max_mem: 100Mb, max_file: 100Mb }
+jetstream : { domain: "DHUB", store_dir: '%s', max_mem: 100Mb, max_file: 100Mb }
 server_name: HUB1
 cluster: {
 	name: HUB
@@ -4940,7 +4940,7 @@ accounts :{
     A:{ jetstream: enabled, users:[ {user:a1,password:a1}]},
 	B:{ jetstream: enabled, users:[ {user:b1,password:b1}]}
 }
-jetstream : { domain: "DHUB", store_dir: "%s", max_mem: 100Mb, max_file: 100Mb }
+jetstream : { domain: "DHUB", store_dir: '%s', max_mem: 100Mb, max_file: 100Mb }
 server_name: HUB2
 cluster: {
 	name: HUB
@@ -4958,7 +4958,7 @@ accounts :{
     A:{ jetstream: enabled,  users:[ {user:a1,password:a1}]},
 	B:{ jetstream: disabled, users:[ {user:b1,password:b1}]}
 }
-jetstream: { domain: "DLEAF", store_dir: "%s", max_mem: 100Mb, max_file: 100Mb }
+jetstream: { domain: "DLEAF", store_dir: '%s', max_mem: 100Mb, max_file: 100Mb }
 server_name: LEAF1
 cluster: {
 	name: LEAF
@@ -4977,7 +4977,7 @@ accounts :{
     A:{ jetstream: enabled,  users:[ {user:a1,password:a1}]},
 	B:{ jetstream: disabled, users:[ {user:b1,password:b1}]}
 }
-jetstream: { domain: "DLEAF", store_dir: "%s", max_mem: 100Mb, max_file: 100Mb }
+jetstream: { domain: "DLEAF", store_dir: '%s', max_mem: 100Mb, max_file: 100Mb }
 server_name: LEAF2
 cluster: {
 	name: LEAF
@@ -5182,4 +5182,101 @@ func TestLeafNodeQueueGroupWithLateLNJoin(t *testing.T) {
 
 	natsPub(t, cln1, "foo", []byte("hello"))
 	natsNexMsg(t, sln2, time.Second)
+}
+
+func TestLeafNodeJetStreamDomainMapCrossTalk(t *testing.T) {
+	accs := `
+accounts :{
+    A:{   jetstream: enable, users:[ {user:a1,password:a1}]},
+    SYS:{ users:[ {user:s1,password:s1}]},
+}
+system_account: SYS
+`
+
+	sd1 := createDir(t, JetStreamStoreDir)
+	defer os.RemoveAll(sd1)
+	confA := createConfFile(t, []byte(fmt.Sprintf(`
+listen: 127.0.0.1:-1
+%s
+jetstream: { domain: da, store_dir: '%s', max_mem: 50Mb, max_file: 50Mb }
+leafnodes: {
+	listen: 127.0.0.1:-1
+	no_advertise: true
+	authorization: {
+		timeout: 0.5
+	}
+}
+`, accs, sd1)))
+	defer removeFile(t, confA)
+	sA, _ := RunServerWithConfig(confA)
+	defer sA.Shutdown()
+
+	sd2 := createDir(t, JetStreamStoreDir)
+	defer os.RemoveAll(sd2)
+	confL := createConfFile(t, []byte(fmt.Sprintf(`
+listen: 127.0.0.1:-1
+%s
+jetstream: { domain: dl, store_dir: '%s', max_mem: 50Mb, max_file: 50Mb }
+leafnodes:{
+	no_advertise: true
+    remotes:[{url:nats://a1:a1@127.0.0.1:%d, account: A},
+		     {url:nats://s1:s1@127.0.0.1:%d, account: SYS}]
+}
+`, accs, sd2, sA.opts.LeafNode.Port, sA.opts.LeafNode.Port)))
+	defer removeFile(t, confL)
+	sL, _ := RunServerWithConfig(confL)
+	defer sL.Shutdown()
+
+	ncA := natsConnect(t, sA.ClientURL(), nats.UserInfo("a1", "a1"))
+	defer ncA.Close()
+	ncL := natsConnect(t, sL.ClientURL(), nats.UserInfo("a1", "a1"))
+	defer ncL.Close()
+
+	test := func(jsA, jsL nats.JetStreamContext) {
+		kvA, err := jsA.CreateKeyValue(&nats.KeyValueConfig{Bucket: "bucket"})
+		require_NoError(t, err)
+		kvL, err := jsL.CreateKeyValue(&nats.KeyValueConfig{Bucket: "bucket"})
+		require_NoError(t, err)
+
+		_, err = kvA.Put("A", nil)
+		require_NoError(t, err)
+		_, err = kvL.Put("L", nil)
+		require_NoError(t, err)
+
+		// check for unwanted cross talk
+		_, err = kvA.Get("A")
+		require_NoError(t, err)
+		_, err = kvA.Get("l")
+		require_Error(t, err)
+		require_True(t, err == nats.ErrKeyNotFound)
+
+		_, err = kvL.Get("A")
+		require_Error(t, err)
+		require_True(t, err == nats.ErrKeyNotFound)
+		_, err = kvL.Get("L")
+		require_NoError(t, err)
+
+		err = jsA.DeleteKeyValue("bucket")
+		require_NoError(t, err)
+		err = jsL.DeleteKeyValue("bucket")
+		require_NoError(t, err)
+	}
+
+	jsA, err := ncA.JetStream()
+	require_NoError(t, err)
+	jsL, err := ncL.JetStream()
+	require_NoError(t, err)
+	test(jsA, jsL)
+
+	jsAL, err := ncA.JetStream(nats.Domain("dl"))
+	require_NoError(t, err)
+	jsLA, err := ncL.JetStream(nats.Domain("da"))
+	require_NoError(t, err)
+	test(jsAL, jsLA)
+
+	jsAA, err := ncA.JetStream(nats.Domain("da"))
+	require_NoError(t, err)
+	jsLL, err := ncL.JetStream(nats.Domain("dl"))
+	require_NoError(t, err)
+	test(jsAA, jsLL)
 }

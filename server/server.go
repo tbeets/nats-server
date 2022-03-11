@@ -107,7 +107,10 @@ type Info struct {
 
 // Server is our main struct.
 type Server struct {
+	// Fields accessed with atomic operations need to be 64-bit aligned
 	gcid uint64
+	// How often user logon fails due to the issuer account not being pinned.
+	pinnedAccFail uint64
 	stats
 	mu                  sync.Mutex
 	kp                  nkeys.KeyPair
@@ -265,9 +268,6 @@ type Server struct {
 	// the server will create a fake user and add it to the list of users.
 	// Keep track of what that user name is for config reload purposes.
 	sysAccOnlyNoAuthUser string
-
-	// How often user logon fails due to the issuer account not being pinned.
-	pinnedAccFail uint64
 
 	// This is a central logger for IPQueues when the number of pending
 	// messages reaches a certain thresold (per queue)
@@ -1405,10 +1405,12 @@ func (s *Server) registerAccountNoLock(acc *Account) *Account {
 			if jsEnabled {
 				s.Warnf("Skipping Default Domain %q, set for JetStream enabled account %q", defDomain, accName)
 			} else if defDomain != _EMPTY_ {
-				dest := fmt.Sprintf(jsDomainAPI, defDomain)
-				s.Noticef("Adding default domain mapping %q -> %q to account %q %p", jsAllAPI, dest, accName, acc)
-				if err := acc.AddMapping(jsAllAPI, dest); err != nil {
-					s.Errorf("Error adding JetStream default domain mapping: %v", err)
+				for src, dest := range generateJSMappingTable(defDomain) {
+					// flip src and dest around so the domain is inserted
+					s.Noticef("Adding default domain mapping %q -> %q to account %q %p", dest, src, accName, acc)
+					if err := acc.AddMapping(dest, src); err != nil {
+						s.Errorf("Error adding JetStream default domain mapping: %v", err)
+					}
 				}
 			}
 		}

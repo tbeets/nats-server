@@ -677,7 +677,6 @@ func TestConnzLastActivity(t *testing.T) {
 		if barLA.Equal(nextLA) {
 			t.Fatalf("Publish should have triggered update to LastActivity\n")
 		}
-		barLA = nextLA
 
 		// Message delivery on ncFoo should have triggered as well.
 		nextLA = ciFoo.LastActivity
@@ -4023,7 +4022,7 @@ func TestMonitorJsz(t *testing.T) {
 		jetstream: {
 			max_mem_store: 10Mb
 			max_file_store: 10Mb
-			store_dir: %s
+			store_dir: '%s'
 		}
 		cluster {
 			name: cluster_name

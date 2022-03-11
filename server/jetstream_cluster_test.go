@@ -23,7 +23,7 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"os"
-	"path"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -38,7 +38,7 @@ import (
 func TestJetStreamClusterConfig(t *testing.T) {
 	conf := createConfFile(t, []byte(`
 		listen: 127.0.0.1:-1
-		jetstream: {max_mem_store: 16GB, max_file_store: 10TB, store_dir: "%s"}
+		jetstream: {max_mem_store: 16GB, max_file_store: 10TB, store_dir: '%s'}
 		cluster { listen: 127.0.0.1:-1 }
 	`))
 	defer removeFile(t, conf)
@@ -59,7 +59,7 @@ func TestJetStreamClusterConfig(t *testing.T) {
 	conf = createConfFile(t, []byte(`
 		listen: 127.0.0.1:-1
 		server_name: "TEST"
-		jetstream: {max_mem_store: 16GB, max_file_store: 10TB, store_dir: "%s"}
+		jetstream: {max_mem_store: 16GB, max_file_store: 10TB, store_dir: '%s'}
 		cluster { listen: 127.0.0.1:-1 }
 	`))
 	defer removeFile(t, conf)
@@ -282,7 +282,7 @@ func TestJetStreamClusterMultiReplicaStreamsDefaultFileMem(t *testing.T) {
 	const testConfig = `
 	listen: 127.0.0.1:-1
 	server_name: %s
-	jetstream: {store_dir: "%s"}
+	jetstream: {store_dir: '%s'}
 
 	cluster {
 		name: %s
@@ -4309,7 +4309,7 @@ func TestJetStreamClusterStreamLeaderStepDown(t *testing.T) {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 	if cdResp.Error != nil {
-		t.Fatalf("Unexpected error: %+v", sdResp.Error)
+		t.Fatalf("Unexpected error: %+v", cdResp.Error)
 	}
 
 	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
@@ -5469,7 +5469,7 @@ func TestJetStreamClusterSuperClusterInterestOnlyMode(t *testing.T) {
 	template := `
 		listen: 127.0.0.1:-1
 		server_name: %s
-		jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: "%s"}
+		jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
 		accounts {
 			one {
 				jetstream: enabled
@@ -6875,7 +6875,7 @@ func TestJetStreamClusterDomainsWithNoJSHub(t *testing.T) {
 	// Client based API - Connected to the core cluster with no JS but account has JS.
 	s := c.randomServer()
 	// Make sure the JS interest from the LNs has made it to this server.
-	checkSubInterest(t, s, "NOJS", "$JS.SPOKE.API.>", time.Second)
+	checkSubInterest(t, s, "NOJS", "$JS.SPOKE.API.INFO", time.Second)
 	nc, _ := jsClientConnect(t, s, nats.UserInfo("nojs", "p"))
 	defer nc.Close()
 
@@ -7668,7 +7668,7 @@ func TestJetStreamClusterCrossAccountInterop(t *testing.T) {
 	template := `
 	listen: 127.0.0.1:-1
 	server_name: %s
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, domain: HUB, store_dir: "%s"}
+	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, domain: HUB, store_dir: '%s'}
 
 	cluster {
 		name: %s
@@ -8685,7 +8685,7 @@ func TestJetStreamClusterStreamCatchupNoState(t *testing.T) {
 	c.stopAll()
 	// Remove all state by truncating for the non-leader.
 	for _, fn := range []string{"1.blk", "1.idx", "1.fss"} {
-		fname := path.Join(config.StoreDir, "$G", "streams", "TEST", "msgs", fn)
+		fname := filepath.Join(config.StoreDir, "$G", "streams", "TEST", "msgs", fn)
 		fd, err := os.OpenFile(fname, os.O_RDWR, defaultFilePerms)
 		if err != nil {
 			continue
@@ -8694,9 +8694,9 @@ func TestJetStreamClusterStreamCatchupNoState(t *testing.T) {
 		fd.Close()
 	}
 	// For both make sure we have no raft snapshots.
-	snapDir := path.Join(lconfig.StoreDir, "$SYS", "_js_", gname, "snapshots")
+	snapDir := filepath.Join(lconfig.StoreDir, "$SYS", "_js_", gname, "snapshots")
 	os.RemoveAll(snapDir)
-	snapDir = path.Join(config.StoreDir, "$SYS", "_js_", gname, "snapshots")
+	snapDir = filepath.Join(config.StoreDir, "$SYS", "_js_", gname, "snapshots")
 	os.RemoveAll(snapDir)
 
 	// Now restart.
@@ -8775,7 +8775,7 @@ func TestJetStreamClusterFlowControlRequiresHeartbeats(t *testing.T) {
 var jsClusterAccountLimitsTempl = `
 	listen: 127.0.0.1:-1
 	server_name: %s
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: "%s"}
+	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
 
 	cluster {
 		name: %s
@@ -8850,7 +8850,7 @@ func TestJetStreamClusterMirrorAndSourceCrossNonNeighboringDomain(t *testing.T) 
 	storeDir1 := createDir(t, JetStreamStoreDir)
 	conf1 := createConfFile(t, []byte(fmt.Sprintf(`
 		listen: 127.0.0.1:-1
-		jetstream: {max_mem_store: 256MB, max_file_store: 256MB, domain: domain1, store_dir: "%s"}
+		jetstream: {max_mem_store: 256MB, max_file_store: 256MB, domain: domain1, store_dir: '%s'}
 		accounts {
 			A:{   jetstream: enable, users:[ {user:a1,password:a1}]},
 			SYS:{ users:[ {user:s1,password:s1}]},
@@ -8866,7 +8866,7 @@ func TestJetStreamClusterMirrorAndSourceCrossNonNeighboringDomain(t *testing.T) 
 	storeDir2 := createDir(t, JetStreamStoreDir)
 	conf2 := createConfFile(t, []byte(fmt.Sprintf(`
 		listen: 127.0.0.1:-1
-		jetstream: {max_mem_store: 256MB, max_file_store: 256MB, domain: domain2, store_dir: "%s"}
+		jetstream: {max_mem_store: 256MB, max_file_store: 256MB, domain: domain2, store_dir: '%s'}
 		accounts {
 			A:{   jetstream: enable, users:[ {user:a1,password:a1}]},
 			SYS:{ users:[ {user:s1,password:s1}]},
@@ -8883,7 +8883,7 @@ func TestJetStreamClusterMirrorAndSourceCrossNonNeighboringDomain(t *testing.T) 
 	storeDir3 := createDir(t, JetStreamStoreDir)
 	conf3 := createConfFile(t, []byte(fmt.Sprintf(`
 		listen: 127.0.0.1:-1
-		jetstream: {max_mem_store: 256MB, max_file_store: 256MB, domain: domain3, store_dir: "%s"}
+		jetstream: {max_mem_store: 256MB, max_file_store: 256MB, domain: domain3, store_dir: '%s'}
 		accounts {
 			A:{   jetstream: enable, users:[ {user:a1,password:a1}]},
 			SYS:{ users:[ {user:s1,password:s1}]},
@@ -8961,11 +8961,10 @@ func TestJetStreamClusterMirrorAndSourceCrossNonNeighboringDomain(t *testing.T) 
 
 func TestJetStreamSeal(t *testing.T) {
 	s := RunBasicJetStreamServer()
-	defer s.Shutdown()
-
 	if config := s.JetStreamConfig(); config != nil {
 		defer removeDir(t, config.StoreDir)
 	}
+	defer s.Shutdown()
 
 	c := createJetStreamClusterExplicit(t, "JSC", 3)
 	defer c.shutdown()
@@ -9572,11 +9571,10 @@ func TestJetStreamClusterAccountInfoForSystemAccount(t *testing.T) {
 
 func TestJetStreamListFilter(t *testing.T) {
 	s := RunBasicJetStreamServer()
-	defer s.Shutdown()
-
 	if config := s.JetStreamConfig(); config != nil {
 		defer removeDir(t, config.StoreDir)
 	}
+	defer s.Shutdown()
 
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
@@ -9629,11 +9627,10 @@ func TestJetStreamListFilter(t *testing.T) {
 
 func TestJetStreamConsumerUpdates(t *testing.T) {
 	s := RunBasicJetStreamServer()
-	defer s.Shutdown()
-
 	if config := s.JetStreamConfig(); config != nil {
 		defer removeDir(t, config.StoreDir)
 	}
+	defer s.Shutdown()
 
 	c := createJetStreamClusterExplicit(t, "JSC", 5)
 	defer c.shutdown()
@@ -10427,11 +10424,10 @@ func TestJetStreamClusterRedeliverBackoffs(t *testing.T) {
 
 func TestJetStreamConsumerUpgrade(t *testing.T) {
 	s := RunBasicJetStreamServer()
-	defer s.Shutdown()
-
 	if config := s.JetStreamConfig(); config != nil {
 		defer removeDir(t, config.StoreDir)
 	}
+	defer s.Shutdown()
 
 	c := createJetStreamClusterExplicit(t, "JSC", 3)
 	defer c.shutdown()
@@ -10457,11 +10453,10 @@ func TestJetStreamConsumerUpgrade(t *testing.T) {
 
 func TestJetStreamAddConsumerWithInfo(t *testing.T) {
 	s := RunBasicJetStreamServer()
-	defer s.Shutdown()
-
 	if config := s.JetStreamConfig(); config != nil {
 		defer removeDir(t, config.StoreDir)
 	}
+	defer s.Shutdown()
 
 	c := createJetStreamClusterExplicit(t, "JSC", 3)
 	defer c.shutdown()
@@ -10918,6 +10913,20 @@ func TestJetStreamClusterFilteredAndIdleConsumerNRGGrowth(t *testing.T) {
 	if entries, _ := o.raftNode().Size(); entries > compactNumMin {
 		t.Fatalf("Expected <= %d entries, got %d", compactNumMin, entries)
 	}
+
+	// Now make the consumer leader stepdown and make sure we have the proper snapshot.
+	resp, err := nc.Request(fmt.Sprintf(JSApiConsumerLeaderStepDownT, "TEST", "dlc"), nil, time.Second)
+	require_NoError(t, err)
+
+	var cdResp JSApiConsumerLeaderStepDownResponse
+	if err := json.Unmarshal(resp.Data, &cdResp); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if cdResp.Error != nil {
+		t.Fatalf("Unexpected error: %+v", cdResp.Error)
+	}
+
+	c.waitOnConsumerLeader("$G", "TEST", "dlc")
 }
 
 func TestJetStreamClusterMirrorOrSourceNotActiveReporting(t *testing.T) {
@@ -10946,11 +10955,10 @@ func TestJetStreamClusterMirrorOrSourceNotActiveReporting(t *testing.T) {
 
 func TestJetStreamStreamAdvisories(t *testing.T) {
 	s := RunBasicJetStreamServer()
-	defer s.Shutdown()
-
 	if config := s.JetStreamConfig(); config != nil {
 		defer removeDir(t, config.StoreDir)
 	}
+	defer s.Shutdown()
 
 	c := createJetStreamClusterExplicit(t, "JSC", 3)
 	defer c.shutdown()
@@ -11125,7 +11133,7 @@ var jsClusterAccountsTempl = `
 	listen: 127.0.0.1:-1
 
 	server_name: %s
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: "%s"}
+	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
 
 	leaf {
 		listen: 127.0.0.1:-1
@@ -11150,7 +11158,7 @@ var jsClusterAccountsTempl = `
 var jsClusterTempl = `
 	listen: 127.0.0.1:-1
 	server_name: %s
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: "%s"}
+	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
 
 	leaf {
 		listen: 127.0.0.1:-1
@@ -11169,7 +11177,7 @@ var jsClusterTempl = `
 var jsClusterMaxBytesTempl = `
 	listen: 127.0.0.1:-1
 	server_name: %s
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: "%s"}
+	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
 
 	leaf {
 		listen: 127.0.0.1:-1
@@ -11211,7 +11219,7 @@ var jsSuperClusterTempl = `
 var jsClusterLimitsTempl = `
 	listen: 127.0.0.1:-1
 	server_name: %s
-	jetstream: {max_mem_store: 2MB, max_file_store: 8MB, store_dir: "%s"}
+	jetstream: {max_mem_store: 2MB, max_file_store: 8MB, store_dir: '%s'}
 
 	cluster {
 		name: %s
@@ -11233,7 +11241,7 @@ var jsClusterLimitsTempl = `
 var jsMixedModeGlobalAccountTempl = `
 	listen: 127.0.0.1:-1
 	server_name: %s
-	jetstream: {max_mem_store: 2MB, max_file_store: 8MB, store_dir: "%s"}
+	jetstream: {max_mem_store: 2MB, max_file_store: 8MB, store_dir: '%s'}
 
 	cluster {
 		name: %s
@@ -11420,7 +11428,7 @@ func (sc *supercluster) waitOnPeerCount(n int) {
 var jsClusterMirrorSourceImportsTempl = `
 	listen: 127.0.0.1:-1
 	server_name: %s
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: "%s"}
+	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
 
 	cluster {
 		name: %s
@@ -11456,7 +11464,7 @@ var jsClusterMirrorSourceImportsTempl = `
 var jsClusterImportsTempl = `
 	listen: 127.0.0.1:-1
 	server_name: %s
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: "%s"}
+	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
 
 	cluster {
 		name: %s
@@ -11658,7 +11666,7 @@ func (c *cluster) createSingleLeafNodeNoSystemAccountAndEnablesJetStreamWithDoma
 var jsClusterSingleLeafNodeLikeNGSTempl = `
 	listen: 127.0.0.1:-1
 	server_name: LNJS
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: "%s"}
+	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
 
 	leaf { remotes [ { urls: [ %s ] } ] }
 `
@@ -11666,7 +11674,7 @@ var jsClusterSingleLeafNodeLikeNGSTempl = `
 var jsClusterSingleLeafNodeTempl = `
 	listen: 127.0.0.1:-1
 	server_name: LNJS
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: "%s"}
+	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
 
 	leaf { remotes [
 		{ urls: [ %s ], account: "JSY" }
@@ -11683,7 +11691,7 @@ var jsClusterSingleLeafNodeTempl = `
 var jsClusterTemplWithLeafNode = `
 	listen: 127.0.0.1:-1
 	server_name: %s
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: "%s"}
+	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
 
 	{{leaf}}
 
@@ -11702,7 +11710,7 @@ var jsClusterTemplWithLeafNodeNoJS = `
 	server_name: %s
 
 	# Need to keep below since it fills in the store dir by default so just comment out.
-	# jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: "%s"}
+	# jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
 
 	{{leaf}}
 
@@ -11719,7 +11727,7 @@ var jsClusterTemplWithLeafNodeNoJS = `
 var jsClusterTemplWithSingleLeafNode = `
 	listen: 127.0.0.1:-1
 	server_name: %s
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: "%s"}
+	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
 
 	{{leaf}}
 
@@ -11731,7 +11739,7 @@ var jsClusterTemplWithSingleLeafNodeNoJS = `
 	listen: 127.0.0.1:-1
 	server_name: %s
 
-	# jetstream: {store_dir: "%s"}
+	# jetstream: {store_dir: '%s'}
 
 	{{leaf}}
 
