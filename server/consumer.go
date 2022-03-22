@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nuid"
@@ -198,6 +199,10 @@ var (
 
 // Consumer is a jetstream consumer.
 type consumer struct {
+	// Atomic used to notify that we want to process an ack.
+	// This will be checked in checkPending to abort processing
+	// and let ack be processed in priority.
+	awl               int64
 	mu                sync.RWMutex
 	js                *jetStream
 	mset              *stream
@@ -270,6 +275,9 @@ type consumer struct {
 	pch   chan struct{}
 	phead *proposal
 	ptail *proposal
+
+	// Ack queue
+	ackMsgs *ipQueue
 }
 
 type proposal struct {
@@ -484,8 +492,12 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 	if c == nil {
 		return nil, NewJSStreamInvalidError()
 	}
+	var accName string
 	c.mu.Lock()
 	s, a := c.srv, c.acc
+	if a != nil {
+		accName = a.Name
+	}
 	c.mu.Unlock()
 
 	// Hold mset lock here.
@@ -586,6 +598,9 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 			}
 		}
 	}
+	// Create ackMsgs queue now that we have a consumer name
+	o.ackMsgs = s.newIPQueue(fmt.Sprintf("[ACC:%s] consumer '%s' on stream '%s' ackMsgs", accName, o.name, mset.cfg.Name))
+
 	// Create our request waiting queue.
 	if o.isPullMode() {
 		o.waiting = newWaitQueue(config.MaxWaiting)
@@ -795,7 +810,7 @@ func (o *consumer) setLeader(isLeader bool) {
 		}
 
 		var err error
-		if o.ackSub, err = o.subscribeInternal(o.ackSubj, o.processAck); err != nil {
+		if o.ackSub, err = o.subscribeInternal(o.ackSubj, o.pushAck); err != nil {
 			o.mu.Unlock()
 			o.deleteWithoutAdvisory()
 			return
@@ -1384,9 +1399,55 @@ func (o *consumer) sendAckReply(subj string) {
 	o.sendAdvisory(subj, nil)
 }
 
-// Process a message for the ack reply subject delivered with a message.
-func (o *consumer) processAck(_ *subscription, c *client, acc *Account, subject, reply string, rmsg []byte) {
-	_, msg := c.msgParts(rmsg)
+type jsAckMsg struct {
+	subject string
+	reply   string
+	hdr     int
+	msg     []byte
+}
+
+var jsAckMsgPool sync.Pool
+
+func newJSAckMsg(subj, reply string, hdr int, msg []byte) *jsAckMsg {
+	var m *jsAckMsg
+	am := jsAckMsgPool.Get()
+	if am != nil {
+		m = am.(*jsAckMsg)
+	} else {
+		m = &jsAckMsg{}
+	}
+	// When getting something from a pool it is criticical that all fields are
+	// initialized. Doing this way guarantees that if someone adds a field to
+	// the structure, the compiler will fail the build if this line is not updated.
+	(*m) = jsAckMsg{subj, reply, hdr, msg}
+	return m
+}
+
+func (am *jsAckMsg) returnToPool() {
+	if am == nil {
+		return
+	}
+	am.subject, am.reply, am.hdr, am.msg = _EMPTY_, _EMPTY_, -1, nil
+	jsAckMsgPool.Put(am)
+}
+
+// Push the ack message to the consumer's ackMsgs queue
+func (o *consumer) pushAck(_ *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	atomic.AddInt64(&o.awl, 1)
+	o.ackMsgs.push(newJSAckMsg(subject, reply, c.pa.hdr, copyBytes(rmsg)))
+}
+
+// Processes a message for the ack reply subject delivered with a message.
+func (o *consumer) processAck(subject, reply string, hdr int, rmsg []byte) {
+	defer atomic.AddInt64(&o.awl, -1)
+
+	var msg []byte
+	if hdr > 0 {
+		msg = rmsg[hdr:]
+	} else {
+		msg = rmsg
+	}
+
 	sseq, dseq, dc := ackReplyInfo(subject)
 
 	skipAckReply := sseq == 0
@@ -1396,16 +1457,7 @@ func (o *consumer) processAck(_ *subscription, c *client, acc *Account, subject,
 		o.processAckMsg(sseq, dseq, dc, true)
 	case bytes.HasPrefix(msg, AckNext):
 		o.processAckMsg(sseq, dseq, dc, true)
-		// processNextMsgReq can be invoked from an internal subscription or from here.
-		// Therefore, it has to call msgParts(), so we can't simply pass msg[len(AckNext):]
-		// with current c.pa.hdr because it would cause a panic.  We will save the current
-		// c.pa.hdr value and disable headers before calling processNextMsgReq and then
-		// restore so that we don't mess with the calling stack in case it is used
-		// somewhere else.
-		phdr := c.pa.hdr
-		c.pa.hdr = -1
-		o.processNextMsgReq(nil, c, acc, subject, reply, msg[len(AckNext):])
-		c.pa.hdr = phdr
+		o.processNextMsgRequest(reply, msg[len(AckNext):])
 		skipAckReply = true
 	case bytes.HasPrefix(msg, AckNak):
 		o.processNak(sseq, dseq, dc, msg)
@@ -1760,7 +1812,7 @@ func (o *consumer) readStoredState() error {
 		return nil
 	}
 	state, err := o.store.State()
-	if err == nil && state != nil && state.Delivered.Consumer != 0 {
+	if err == nil && state != nil && (state.Delivered.Consumer != 0 || state.Delivered.Stream != 0) {
 		o.applyState(state)
 		if len(o.rdc) > 0 {
 			o.checkRedelivered()
@@ -2382,7 +2434,10 @@ func (o *consumer) processNextMsgReq(_ *subscription, c *client, _ *Account, _, 
 		return
 	}
 	_, msg = c.msgParts(msg)
+	o.processNextMsgRequest(reply, msg)
+}
 
+func (o *consumer) processNextMsgRequest(reply string, msg []byte) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
@@ -2851,6 +2906,14 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 		o.mu.Unlock()
 
 		select {
+		case <-o.ackMsgs.ch:
+			acks := o.ackMsgs.pop()
+			for _, acki := range acks {
+				ack := acki.(*jsAckMsg)
+				o.processAck(ack.subject, ack.reply, ack.hdr, ack.msg)
+				ack.returnToPool()
+			}
+			o.ackMsgs.recycle(&acks)
 		case interest := <-inch:
 			// inch can be nil on pull-based, but then this will
 			// just block and not fire.
@@ -3190,7 +3253,12 @@ func (o *consumer) checkPending() {
 	// Since we can update timestamps, we have to review all pending.
 	// We may want to unlock here or warn if list is big.
 	var expired []uint64
+	check := len(o.pending) > 1024
 	for seq, p := range o.pending {
+		if check && atomic.LoadInt64(&o.awl) > 0 {
+			o.ptmr.Reset(100 * time.Millisecond)
+			return
+		}
 		// Check if these are no longer valid.
 		if seq < fseq {
 			delete(o.pending, seq)
@@ -3583,6 +3651,7 @@ func (o *consumer) stopWithFlags(dflag, sdflag, doSignal, advisory bool) error {
 	}
 	n := o.node
 	qgroup := o.cfg.DeliverGroup
+	o.ackMsgs.unregister()
 	o.mu.Unlock()
 
 	if c != nil {
@@ -3756,7 +3825,7 @@ func (o *consumer) setInitialPendingAndStart() {
 		}
 	}
 
-	if !filtered && dp != DeliverLastPerSubject {
+	if !filtered && (dp != DeliverLastPerSubject && dp != DeliverNew) {
 		var state StreamState
 		mset.store.FastState(&state)
 		if state.Msgs > 0 {
@@ -3777,7 +3846,12 @@ func (o *consumer) setInitialPendingAndStart() {
 			if dp == DeliverLast || dp == DeliverLastPerSubject {
 				o.sseq = ss.Last
 			} else if dp == DeliverNew {
-				o.sseq = ss.Last + 1
+				// If our original is larger we will ignore, we don't want to go backwards with DeliverNew.
+				// If its greater, we need to adjust pending.
+				if ss.Last >= o.sseq {
+					o.sgap -= (ss.Last - o.sseq + 1)
+					o.sseq = ss.Last + 1
+				}
 			} else {
 				// DeliverAll, DeliverByStartSequence, DeliverByStartTime
 				o.sseq = ss.First
@@ -3788,6 +3862,15 @@ func (o *consumer) setInitialPendingAndStart() {
 			}
 		}
 		o.updateSkipped()
+	}
+
+	// Update our persisted state if something has changed.
+	if store := o.store; store != nil {
+		if state, _ := store.State(); state != nil {
+			if o.dseq-1 > state.Delivered.Consumer || o.sseq-1 > state.Delivered.Stream {
+				o.writeStoreStateUnlocked()
+			}
+		}
 	}
 }
 

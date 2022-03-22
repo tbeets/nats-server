@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -628,7 +629,7 @@ func TestJetStreamConsumerMaxDeliveries(t *testing.T) {
 
 			// Wait for redeliveries to pile up.
 			checkFor(t, 250*time.Millisecond, 10*time.Millisecond, func() error {
-				if nmsgs, _, _ := sub.Pending(); err != nil || nmsgs != maxDeliver {
+				if nmsgs, _, err := sub.Pending(); err != nil || nmsgs != maxDeliver {
 					return fmt.Errorf("Did not receive correct number of messages: %d vs %d", nmsgs, maxDeliver)
 				}
 				return nil
@@ -5982,9 +5983,12 @@ func TestJetStreamInterestRetentionStream(t *testing.T) {
 
 			checkNumMsgs := func(numExpected int) {
 				t.Helper()
-				if state := mset.state(); state.Msgs != uint64(numExpected) {
-					t.Fatalf("Expected %d messages, got %d", numExpected, state.Msgs)
-				}
+				checkFor(t, time.Second, 15*time.Millisecond, func() error {
+					if state := mset.state(); state.Msgs != uint64(numExpected) {
+						return fmt.Errorf("Expected %d messages, got %d", numExpected, state.Msgs)
+					}
+					return nil
+				})
 			}
 
 			// Since we had no interest this should be 0.
@@ -6143,7 +6147,7 @@ func TestJetStreamInterestRetentionStreamWithFilteredConsumers(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Unexpected error getting msg: %v", err)
 				}
-				m.Ack()
+				m.AckSync()
 			}
 
 			checkState := func(expected uint64) {
@@ -6798,6 +6802,587 @@ func TestJetStreamSystemLimits(t *testing.T) {
 	// This one should fail.
 	if _, err := mset.addConsumer(&ConsumerConfig{Durable: "O:22", AckPolicy: AckExplicit}); err == nil {
 		t.Fatalf("Expected error adding consumer over the limit")
+	}
+}
+
+func TestJetStreamSystemLimitsPlacement(t *testing.T) {
+	const smallSystemLimit = 128
+	const mediumSystemLimit = smallSystemLimit * 2
+	const largeSystemLimit = smallSystemLimit * 3
+
+	getServer := func(t *testing.T, serverName string) *Server {
+		storeDir, err := os.MkdirTemp(tempRoot, "jstests-storedir-")
+		require_NoError(t, err)
+
+		natsPort, clusterPort := 24000, 26000
+		systemLimit := smallSystemLimit
+		if serverName == "medium" {
+			natsPort, clusterPort = 24001, 26001
+			systemLimit = mediumSystemLimit
+		} else if serverName == "large" {
+			natsPort, clusterPort = 24002, 26002
+			systemLimit = largeSystemLimit
+		}
+
+		s, _ := RunServerWithConfig(createConfFile(t, []byte(fmt.Sprintf(`
+server_name: %s
+port: %d
+
+jetstream: {
+  enabled: true
+  store_dir: '%s'
+  max_mem: %d
+  max_file: %d
+}
+
+server_tags: [%s]
+
+cluster {
+  name: cluster-a
+  port: %d
+  routes: [
+    nats-route://127.0.0.1:26000
+    nats-route://127.0.0.1:26001
+    nats-route://127.0.0.1:26002
+  ]
+}
+	`,
+			serverName,
+			natsPort,
+			storeDir,
+			systemLimit,
+			systemLimit,
+			serverName,
+			clusterPort,
+		))))
+
+		return s
+	}
+
+	smallSrv := getServer(t, "small")
+	if config := smallSrv.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	defer smallSrv.Shutdown()
+
+	mediumSrv := getServer(t, "medium")
+	if config := mediumSrv.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	defer mediumSrv.Shutdown()
+
+	largeSrv := getServer(t, "large")
+	defer largeSrv.Shutdown()
+	if config := largeSrv.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	defer mediumSrv.Shutdown()
+
+	checkClusterFormed(t, smallSrv, mediumSrv, largeSrv)
+
+	requestLeaderStepDown := func(clientURL string) error {
+		nc, err := nats.Connect(clientURL)
+		if err != nil {
+			return err
+		}
+		defer nc.Close()
+
+		ncResp, err := nc.Request(JSApiLeaderStepDown, nil, time.Second)
+		if err != nil {
+			return err
+		}
+
+		var resp JSApiLeaderStepDownResponse
+		if err := json.Unmarshal(ncResp.Data, &resp); err != nil {
+			return err
+		}
+		if resp.Error != nil {
+			return resp.Error
+		}
+		if !resp.Success {
+			return fmt.Errorf("leader step down request not successful")
+		}
+
+		return nil
+	}
+
+	// Force large server to be leader
+	checkFor(t, 10*time.Second, 500*time.Millisecond, func() error {
+		if largeSrv.JetStreamIsLeader() {
+			return nil
+		}
+
+		if err := requestLeaderStepDown(largeSrv.ClientURL()); err != nil {
+			return err
+		}
+		return fmt.Errorf("large server is not leader")
+	})
+	nc, js := jsClientConnect(t, largeSrv)
+	defer nc.Close()
+
+	cases := []struct {
+		name           string
+		storage        nats.StorageType
+		createMaxBytes int64
+		serverTag      string
+		wantErr        bool
+	}{
+		{
+			name:           "file create large stream on small server",
+			storage:        nats.FileStorage,
+			createMaxBytes: largeSystemLimit,
+			serverTag:      "small",
+			wantErr:        true,
+		},
+		{
+			name:           "memory create large stream on small server",
+			storage:        nats.MemoryStorage,
+			createMaxBytes: largeSystemLimit,
+			serverTag:      "small",
+			wantErr:        true,
+		},
+		{
+			name:           "file create large stream on medium server",
+			storage:        nats.FileStorage,
+			createMaxBytes: largeSystemLimit,
+			serverTag:      "medium",
+			wantErr:        true,
+		},
+		{
+			name:           "memory create large stream on medium server",
+			storage:        nats.MemoryStorage,
+			createMaxBytes: largeSystemLimit,
+			serverTag:      "medium",
+			wantErr:        true,
+		},
+		{
+			name:           "file create large stream on large server",
+			storage:        nats.FileStorage,
+			createMaxBytes: largeSystemLimit,
+			serverTag:      "large",
+		},
+		{
+			name:           "memory create large stream on large server",
+			storage:        nats.MemoryStorage,
+			createMaxBytes: largeSystemLimit,
+			serverTag:      "large",
+		},
+	}
+
+	for i := 0; i < len(cases) && !t.Failed(); i++ {
+		c := cases[i]
+		t.Run(c.name, func(st *testing.T) {
+			_, err := js.AddStream(&nats.StreamConfig{
+				Name:     "TEST",
+				Subjects: []string{"foo"},
+				Storage:  c.storage,
+				MaxBytes: c.createMaxBytes,
+				Placement: &nats.Placement{
+					Cluster: "cluster-a",
+					Tags:    []string{c.serverTag},
+				},
+			})
+			if c.wantErr && err == nil {
+				st.Fatalf("unexpected stream create success, maxBytes=%d, tag=%s",
+					c.createMaxBytes, c.serverTag)
+			} else if !c.wantErr && err != nil {
+				st.Fatalf("unexpected error: %s", err)
+			}
+
+			if err == nil {
+				err = js.DeleteStream("TEST")
+				require_NoError(st, err)
+			}
+		})
+	}
+
+	// These next two tests should fail because although the stream fits in the
+	// large and medium server, it doesn't fit on the small server.
+	si, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Storage:  nats.FileStorage,
+		MaxBytes: smallSystemLimit + 1,
+		Replicas: 3,
+	})
+	if err == nil {
+		t.Fatalf("unexpected file stream create success, maxBytes=%d, replicas=%d",
+			si.Config.MaxBytes, si.Config.Replicas)
+	}
+
+	si, err = js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Storage:  nats.MemoryStorage,
+		MaxBytes: smallSystemLimit + 1,
+		Replicas: 3,
+	})
+	if err == nil {
+		t.Fatalf("unexpected memory stream create success, maxBytes=%d, replicas=%d",
+			si.Config.MaxBytes, si.Config.Replicas)
+	}
+}
+
+func TestJetStreamSuperClusterSystemLimitsPlacement(t *testing.T) {
+	const largeSystemLimit = 1024
+	const smallSystemLimit = 512
+
+	startClusterPorts := []int{20_022, 22_022, 24_022}
+	startGatewayPorts := []int{20_122, 22_122, 24_122}
+	startClusterPort := startClusterPorts[rand.Intn(len(startClusterPorts))]
+	startGWPort := startGatewayPorts[rand.Intn(len(startGatewayPorts))]
+
+	require_NoError(t, os.MkdirAll(tempRoot, 0755))
+	getServer := func(t *testing.T, serverName string) *Server {
+		storeDir, err := os.MkdirTemp(tempRoot, "jstests-storedir-")
+		require_NoError(t, err)
+
+		var (
+			clusterName string
+			systemLimit int
+			clusterPort int
+			gatewayPort int
+		)
+		// serverName should be like "a0", "a1", "b0", "b1"
+		if strings.HasPrefix(serverName, "a") {
+			clusterName = "cluster-a"
+			systemLimit = largeSystemLimit
+
+			idx, err := strconv.Atoi(serverName[1:])
+			require_NoError(t, err)
+
+			clusterPort = startClusterPort + idx
+			gatewayPort = startGWPort + idx
+		} else if strings.HasPrefix(serverName, "b") {
+			clusterName = "cluster-b"
+			systemLimit = smallSystemLimit
+
+			idx, err := strconv.Atoi(serverName[1:])
+			require_NoError(t, err)
+
+			clusterPort = startClusterPort + 10 + idx
+			gatewayPort = startGWPort + 10 + idx
+		}
+
+		route1, route2, route3 := clusterPort, clusterPort+1, clusterPort+2
+
+		s, _ := RunServerWithConfig(createConfFile(t, []byte(fmt.Sprintf(`
+server_name: %s
+listen: 127.0.0.1:-1
+
+jetstream: {
+  enabled: true
+  store_dir: '%s'
+  max_mem: %d
+  max_file: %d
+}
+
+server_tags: [%s]
+
+cluster {
+  name: %s
+  port: %d
+  routes: [
+    nats-route://127.0.0.1:%d
+    nats-route://127.0.0.1:%d
+    nats-route://127.0.0.1:%d
+  ]
+}
+
+gateway {
+  name: %s
+  port: %d
+
+  gateways: [
+    {name: "cluster-a", url: "nats://localhost:%d"},
+    {name: "cluster-b", url: "nats://localhost:%d"},
+  ]
+}
+	`,
+			serverName,
+			storeDir,
+			systemLimit,
+			systemLimit,
+			serverName,
+			clusterName,
+			clusterPort,
+			route1, route2, route3,
+			clusterName,
+			gatewayPort,
+			startGWPort,
+			startGWPort+10,
+		))))
+
+		return s
+	}
+
+	var servers []*Server
+	for _, name := range []string{"a0", "a1", "a2", "b0", "b1", "b2"} {
+		s := getServer(t, name)
+		if config := s.JetStreamConfig(); config != nil {
+			defer removeDir(t, config.StoreDir)
+		}
+		defer s.Shutdown()
+
+		servers = append(servers, s)
+	}
+
+	checkClusterFormed(t, servers[:3]...)
+	checkClusterFormed(t, servers[3:]...)
+
+	for _, s := range servers {
+		waitForOutboundGateways(t, s, 1, 2*time.Second)
+	}
+
+	checkForJSClusterUp(t, servers...)
+
+	// Wait for servers to be current
+	for i, s := range servers {
+		checkFor(t, 20*time.Second, 100*time.Millisecond, func() error {
+			if !s.JetStreamIsCurrent() {
+				return fmt.Errorf("jetstream server %d is not current", i)
+			}
+			return nil
+		})
+	}
+
+	// Wait for all the peer nodes to be registered.
+	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+		var peers []string
+		if ml := servers[0]; ml != nil {
+			peers = ml.ActivePeers()
+			if len(peers) == len(servers) {
+				return nil
+			}
+		}
+		return fmt.Errorf("unexpected peer count, got=%d, want=%d", len(peers), len(servers))
+	})
+
+	requestLeaderStepDown := func(clientURL string) error {
+		nc, err := nats.Connect(clientURL)
+		if err != nil {
+			return err
+		}
+		defer nc.Close()
+
+		ncResp, err := nc.Request(JSApiLeaderStepDown, nil, time.Second)
+		if err != nil {
+			return err
+		}
+
+		var resp JSApiLeaderStepDownResponse
+		if err := json.Unmarshal(ncResp.Data, &resp); err != nil {
+			return err
+		}
+		if resp.Error != nil {
+			return resp.Error
+		}
+		if !resp.Success {
+			return fmt.Errorf("leader step down request not successful")
+		}
+
+		return nil
+	}
+
+	// Force large cluster to be leader
+	checkFor(t, 15*time.Second, 500*time.Millisecond, func() error {
+		a0 := servers[0]
+		if a0.JetStreamIsLeader() {
+			return nil
+		}
+
+		if err := requestLeaderStepDown(a0.ClientURL()); err != nil {
+			return fmt.Errorf("failed to request leader step down: %s", err)
+		}
+		return fmt.Errorf("a0 server is not leader")
+	})
+	getStreams := func(jsm nats.JetStreamManager) []string {
+		var streams []string
+		for s := range jsm.StreamNames() {
+			streams = append(streams, s)
+		}
+		return streams
+	}
+	nc, js := jsClientConnect(t, servers[0])
+	defer nc.Close()
+
+	cases := []struct {
+		name           string
+		storage        nats.StorageType
+		createMaxBytes int64
+		serverTag      string
+		wantErr        bool
+	}{
+		{
+			name:           "file create large stream on small cluster b0",
+			storage:        nats.FileStorage,
+			createMaxBytes: smallSystemLimit + 1,
+			serverTag:      "b0",
+			wantErr:        true,
+		},
+		{
+			name:           "memory create large stream on small cluster b0",
+			storage:        nats.MemoryStorage,
+			createMaxBytes: smallSystemLimit + 1,
+			serverTag:      "b0",
+			wantErr:        true,
+		},
+		{
+			name:           "file create large stream on small cluster b1",
+			storage:        nats.FileStorage,
+			createMaxBytes: smallSystemLimit + 1,
+			serverTag:      "b1",
+			wantErr:        true,
+		},
+		{
+			name:           "memory create large stream on small cluster b1",
+			storage:        nats.MemoryStorage,
+			createMaxBytes: smallSystemLimit + 1,
+			serverTag:      "b1",
+			wantErr:        true,
+		},
+		{
+			name:           "file create large stream on small cluster b2",
+			storage:        nats.FileStorage,
+			createMaxBytes: smallSystemLimit + 1,
+			serverTag:      "b2",
+			wantErr:        true,
+		},
+		{
+			name:           "memory create large stream on small cluster b2",
+			storage:        nats.MemoryStorage,
+			createMaxBytes: smallSystemLimit + 1,
+			serverTag:      "b2",
+			wantErr:        true,
+		},
+		// TODO: The following tests are flaky. Re-enable after debugging.
+		//{
+		//	name:           "file create large stream on large cluster a0",
+		//	storage:        nats.FileStorage,
+		//	createMaxBytes: smallSystemLimit + 1,
+		//	serverTag:      "a0",
+		//},
+		//{
+		//	name:           "memory create large stream on large cluster a0",
+		//	storage:        nats.MemoryStorage,
+		//	createMaxBytes: smallSystemLimit + 1,
+		//	serverTag:      "a0",
+		//},
+		//{
+		//	name:           "file create large stream on large cluster a1",
+		//	storage:        nats.FileStorage,
+		//	createMaxBytes: smallSystemLimit + 1,
+		//	serverTag:      "a1",
+		//},
+		//{
+		//	name:           "memory create large stream on large cluster a1",
+		//	storage:        nats.MemoryStorage,
+		//	createMaxBytes: smallSystemLimit + 1,
+		//	serverTag:      "a1",
+		//},
+		//{
+		//	name:           "file create large stream on large cluster a2",
+		//	storage:        nats.FileStorage,
+		//	createMaxBytes: smallSystemLimit + 1,
+		//	serverTag:      "a2",
+		//},
+		//{
+		//	name:           "memory create large stream on large cluster a2",
+		//	storage:        nats.MemoryStorage,
+		//	createMaxBytes: smallSystemLimit + 1,
+		//	serverTag:      "a2",
+		//},
+	}
+	for i := 0; i < len(cases) && !t.Failed(); i++ {
+		c := cases[i]
+		t.Run(c.name, func(st *testing.T) {
+			var clusterName string
+			if strings.HasPrefix(c.serverTag, "a") {
+				clusterName = "cluster-a"
+			} else if strings.HasPrefix(c.serverTag, "b") {
+				clusterName = "cluster-b"
+			}
+
+			if s := getStreams(js); len(s) != 0 {
+				st.Fatalf("unexpected stream count, got=%d, want=0", len(s))
+			}
+
+			streamName := fmt.Sprintf("TEST-%s", c.serverTag)
+			si, err := js.AddStream(&nats.StreamConfig{
+				Name:     streamName,
+				Subjects: []string{"foo"},
+				Storage:  c.storage,
+				MaxBytes: c.createMaxBytes,
+				Placement: &nats.Placement{
+					Cluster: clusterName,
+					Tags:    []string{c.serverTag},
+				},
+			})
+			if c.wantErr && err == nil {
+				if s := getStreams(js); len(s) != 1 {
+					st.Logf("unexpected stream count, got=%d, want=1, streams=%v", len(s), s)
+				}
+
+				cfg := si.Config
+				st.Fatalf("unexpected success, maxBytes=%d, cluster=%s, tags=%v",
+					cfg.MaxBytes, cfg.Placement.Cluster, cfg.Placement.Tags)
+			} else if !c.wantErr && err != nil {
+				if s := getStreams(js); len(s) != 0 {
+					st.Logf("unexpected stream count, got=%d, want=0, streams=%v", len(s), s)
+				}
+
+				require_NoError(st, err)
+			}
+
+			if err == nil {
+				if s := getStreams(js); len(s) != 1 {
+					st.Fatalf("unexpected stream count, got=%d, want=1", len(s))
+				}
+
+				err = js.DeleteStream(streamName)
+				require_NoError(st, err)
+			}
+		})
+	}
+}
+
+func TestStreamLimitUpdate(t *testing.T) {
+	t.Skip("shouldn't fail")
+
+	s := RunBasicJetStreamServer()
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	defer s.Shutdown()
+
+	err := s.GlobalAccount().UpdateJetStreamLimits(&JetStreamAccountLimits{
+		MaxMemory:  128,
+		MaxStore:   128,
+		MaxStreams: 1,
+	})
+	require_NoError(t, err)
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	for _, storage := range []nats.StorageType{nats.MemoryStorage, nats.FileStorage} {
+		_, err = js.AddStream(&nats.StreamConfig{
+			Name:     "TEST",
+			Subjects: []string{"foo"},
+			Storage:  storage,
+			MaxBytes: 32,
+		})
+		require_NoError(t, err)
+
+		_, err = js.UpdateStream(&nats.StreamConfig{
+			Name:     "TEST",
+			Subjects: []string{"foo"},
+			Storage:  storage,
+			MaxBytes: 16,
+		})
+		require_NoError(t, err)
+
+		require_NoError(t, js.DeleteStream("TEST"))
 	}
 }
 
@@ -11981,7 +12566,7 @@ func TestJetStreamServerEncryption(t *testing.T) {
 	}
 	for i, m := range fetchMsgs(t, sub, 10, 5*time.Second) {
 		if i < 5 {
-			m.Ack()
+			m.AckSync()
 		}
 	}
 
@@ -12436,7 +13021,7 @@ func TestJetStreamConsumerCleanupWithRetentionPolicy(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
-		m.Ack()
+		m.AckSync()
 	}
 
 	ci, err := sub.ConsumerInfo()
@@ -15093,6 +15678,218 @@ func TestJetStreamPullConsumerHeartBeats(t *testing.T) {
 	}
 }
 
+func TestStorageReservedBytes(t *testing.T) {
+	const systemLimit = 1024
+	opts := DefaultTestOptions
+	opts.Port = -1
+	opts.JetStream = true
+	opts.JetStreamMaxMemory = systemLimit
+	opts.JetStreamMaxStore = systemLimit
+	tdir, _ := ioutil.TempDir(tempRoot, "jstests-storedir-")
+	opts.StoreDir = tdir
+	opts.HTTPPort = -1
+	s := RunServer(&opts)
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	defer s.Shutdown()
+
+	// Client for API requests.
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	getJetStreamVarz := func(hc *http.Client, addr string) (JetStreamVarz, error) {
+		resp, err := hc.Get(addr)
+		if err != nil {
+			return JetStreamVarz{}, err
+		}
+		defer resp.Body.Close()
+
+		var v Varz
+		if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+			return JetStreamVarz{}, err
+		}
+
+		return v.JetStream, nil
+	}
+	getReserved := func(hc *http.Client, addr string, st nats.StorageType) (uint64, error) {
+		jsv, err := getJetStreamVarz(hc, addr)
+		if err != nil {
+			return 0, err
+		}
+		if st == nats.MemoryStorage {
+			return jsv.Stats.ReservedMemory, nil
+		}
+		return jsv.Stats.ReservedStore, nil
+	}
+
+	varzAddr := fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port)
+	hc := &http.Client{Timeout: 5 * time.Second}
+
+	jsv, err := getJetStreamVarz(hc, varzAddr)
+	require_NoError(t, err)
+
+	if got, want := systemLimit, int(jsv.Config.MaxMemory); got != want {
+		t.Fatalf("Unexpected max memory: got=%d, want=%d", got, want)
+	}
+	if got, want := systemLimit, int(jsv.Config.MaxStore); got != want {
+		t.Fatalf("Unexpected max store: got=%d, want=%d", got, want)
+	}
+
+	cases := []struct {
+		name            string
+		accountLimit    int64
+		storage         nats.StorageType
+		createMaxBytes  int64
+		updateMaxBytes  int64
+		wantUpdateError bool
+	}{
+		{
+			name:           "file reserve 66% of system limit",
+			accountLimit:   -1,
+			storage:        nats.FileStorage,
+			createMaxBytes: int64(math.Round(float64(systemLimit) * .666)),
+			updateMaxBytes: int64(math.Round(float64(systemLimit)*.666)) + 1,
+		},
+		{
+			name:           "memory reserve 66% of system limit",
+			accountLimit:   -1,
+			storage:        nats.MemoryStorage,
+			createMaxBytes: int64(math.Round(float64(systemLimit) * .666)),
+			updateMaxBytes: int64(math.Round(float64(systemLimit)*.666)) + 1,
+		},
+		{
+			name:            "file update past system limit",
+			accountLimit:    -1,
+			storage:         nats.FileStorage,
+			createMaxBytes:  systemLimit,
+			updateMaxBytes:  systemLimit + 1,
+			wantUpdateError: true,
+		},
+		{
+			name:            "memory update past system limit",
+			accountLimit:    -1,
+			storage:         nats.MemoryStorage,
+			createMaxBytes:  systemLimit,
+			updateMaxBytes:  systemLimit + 1,
+			wantUpdateError: true,
+		},
+		{
+			name:           "file update to system limit",
+			accountLimit:   -1,
+			storage:        nats.FileStorage,
+			createMaxBytes: systemLimit - 1,
+			updateMaxBytes: systemLimit,
+		},
+		{
+			name:           "memory update to system limit",
+			accountLimit:   -1,
+			storage:        nats.MemoryStorage,
+			createMaxBytes: systemLimit - 1,
+			updateMaxBytes: systemLimit,
+		},
+		{
+			name:           "file reserve 66% of account limit",
+			accountLimit:   systemLimit / 2,
+			storage:        nats.FileStorage,
+			createMaxBytes: int64(math.Round(float64(systemLimit/2) * .666)),
+			updateMaxBytes: int64(math.Round(float64(systemLimit/2)*.666)) + 1,
+		},
+		{
+			name:           "memory reserve 66% of account limit",
+			accountLimit:   systemLimit / 2,
+			storage:        nats.MemoryStorage,
+			createMaxBytes: int64(math.Round(float64(systemLimit/2) * .666)),
+			updateMaxBytes: int64(math.Round(float64(systemLimit/2)*.666)) + 1,
+		},
+		// TODO: Enable these once account limits are enforced.
+		//{
+		//	name:            "file update past account limit",
+		//	accountLimit:    systemLimit / 2,
+		//	storage:         nats.FileStorage,
+		//	createMaxBytes:  (systemLimit / 2),
+		//	updateMaxBytes:  (systemLimit / 2) + 1,
+		//	wantUpdateError: true,
+		//},
+		//{
+		//	name:            "memory update past account limit",
+		//	accountLimit:    systemLimit / 2,
+		//	storage:         nats.MemoryStorage,
+		//	createMaxBytes:  (systemLimit / 2),
+		//	updateMaxBytes:  (systemLimit / 2) + 1,
+		//	wantUpdateError: true,
+		//},
+		{
+			name:           "file update to account limit",
+			accountLimit:   systemLimit / 2,
+			storage:        nats.FileStorage,
+			createMaxBytes: (systemLimit / 2) - 1,
+			updateMaxBytes: (systemLimit / 2),
+		},
+		{
+			name:           "memory update to account limit",
+			accountLimit:   systemLimit / 2,
+			storage:        nats.MemoryStorage,
+			createMaxBytes: (systemLimit / 2) - 1,
+			updateMaxBytes: (systemLimit / 2),
+		},
+	}
+	for i := 0; i < len(cases) && !t.Failed(); i++ {
+		c := cases[i]
+		t.Run(c.name, func(st *testing.T) {
+			// Setup limits
+			err = s.GlobalAccount().UpdateJetStreamLimits(&JetStreamAccountLimits{
+				MaxMemory: c.accountLimit,
+				MaxStore:  c.accountLimit,
+			})
+			require_NoError(st, err)
+
+			// Create initial stream
+			cfg := &nats.StreamConfig{
+				Name:     "TEST",
+				Subjects: []string{"foo"},
+				Storage:  c.storage,
+				MaxBytes: c.createMaxBytes,
+			}
+			_, err = js.AddStream(cfg)
+			require_NoError(st, err)
+
+			// Update stream MaxBytes
+			cfg.MaxBytes = c.updateMaxBytes
+			info, err := js.UpdateStream(cfg)
+			if c.wantUpdateError && err == nil {
+				got := info.Config.MaxBytes
+				st.Fatalf("Unexpected update success, newMaxBytes=%d; systemLimit=%d; accountLimit=%d",
+					got, systemLimit, c.accountLimit)
+			} else if !c.wantUpdateError && err != nil {
+				st.Fatalf("Unexpected update error: %s", err)
+			}
+
+			if !c.wantUpdateError && err == nil {
+				// If update was successful, then ensure reserved shows new
+				// amount
+				reserved, err := getReserved(hc, varzAddr, c.storage)
+				require_NoError(st, err)
+				if got, want := reserved, uint64(c.updateMaxBytes); got != want {
+					st.Fatalf("Unexpected reserved: %d, want %d", got, want)
+				}
+			}
+
+			// Delete stream
+			err = js.DeleteStream("TEST")
+			require_NoError(st, err)
+
+			// Ensure reserved shows 0 because we've deleted the stream
+			reserved, err := getReserved(hc, varzAddr, c.storage)
+			require_NoError(st, err)
+			if reserved != 0 {
+				st.Fatalf("Unexpected reserved: %d, want 0", reserved)
+			}
+		})
+	}
+}
+
 func TestJetStreamRecoverStreamWithDeletedMessagesNonCleanShutdown(t *testing.T) {
 	s := RunBasicJetStreamServer()
 	if config := s.JetStreamConfig(); config != nil {
@@ -15195,6 +15992,222 @@ func TestJetStreamRestoreBadStream(t *testing.T) {
 			t.Fatalf("Found file %s", f)
 		}
 	}
+}
+
+func TestJetStreamConsumerAckSampling(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:         "dlc",
+		AckPolicy:       nats.AckExplicitPolicy,
+		FilterSubject:   "foo",
+		SampleFrequency: "100%",
+	})
+	require_NoError(t, err)
+
+	sub, err := js.PullSubscribe("foo", "dlc")
+	require_NoError(t, err)
+
+	_, err = js.Publish("foo", []byte("Hello"))
+	require_NoError(t, err)
+
+	msub, err := nc.SubscribeSync("$JS.EVENT.METRIC.>")
+	require_NoError(t, err)
+
+	for _, m := range fetchMsgs(t, sub, 1, time.Second) {
+		err = m.AckSync()
+		require_NoError(t, err)
+	}
+
+	m, err := msub.NextMsg(time.Second)
+	require_NoError(t, err)
+
+	var am JSConsumerAckMetric
+	err = json.Unmarshal(m.Data, &am)
+	require_NoError(t, err)
+
+	if am.Stream != "TEST" || am.Consumer != "dlc" || am.ConsumerSeq != 1 {
+		t.Fatalf("Not a proper ack metric: %+v", am)
+	}
+
+	// Do less than 100%
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:         "alps",
+		AckPolicy:       nats.AckExplicitPolicy,
+		FilterSubject:   "foo",
+		SampleFrequency: "50%",
+	})
+	require_NoError(t, err)
+
+	asub, err := js.PullSubscribe("foo", "alps")
+	require_NoError(t, err)
+
+	total := 500
+	for i := 0; i < total; i++ {
+		_, err = js.Publish("foo", []byte("Hello"))
+		require_NoError(t, err)
+	}
+
+	mp := 0
+	for _, m := range fetchMsgs(t, asub, total, time.Second) {
+		err = m.AckSync()
+		require_NoError(t, err)
+		mp++
+	}
+	nc.Flush()
+
+	if mp != total {
+		t.Fatalf("Got only %d msgs out of %d", mp, total)
+	}
+
+	nmsgs, _, err := msub.Pending()
+	require_NoError(t, err)
+
+	// Should be ~250
+	if nmsgs < 200 || nmsgs > 300 {
+		t.Fatalf("Expected about 250, got %d", nmsgs)
+	}
+}
+
+func TestJetStreamRemoveExternalSource(t *testing.T) {
+	ho := DefaultTestOptions
+	ho.Port = 4000 //-1
+	ho.LeafNode.Host = "127.0.0.1"
+	ho.LeafNode.Port = -1
+	hs := RunServer(&ho)
+	defer hs.Shutdown()
+
+	lu, err := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", ho.LeafNode.Port))
+	require_NoError(t, err)
+
+	tdir, _ := ioutil.TempDir(tempRoot, "jstests-storedir-")
+	defer removeDir(t, tdir)
+	lo1 := DefaultTestOptions
+	lo1.Port = 4111 //-1
+	lo1.ServerName = "a-leaf"
+	lo1.JetStream = true
+	lo1.StoreDir = tdir
+	lo1.JetStreamDomain = "a-leaf"
+	lo1.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{lu}}}
+	l1 := RunServer(&lo1)
+	defer l1.Shutdown()
+
+	tdir, _ = ioutil.TempDir(tempRoot, "jstests-storedir-")
+	defer removeDir(t, tdir)
+	lo2 := DefaultTestOptions
+	lo2.Port = 2111 //-1
+	lo2.ServerName = "b-leaf"
+	lo2.JetStream = true
+	lo2.StoreDir = tdir
+	lo2.JetStreamDomain = "b-leaf"
+	lo2.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{lu}}}
+	l2 := RunServer(&lo2)
+	defer l2.Shutdown()
+
+	checkLeafNodeConnected(t, l1)
+	checkLeafNodeConnected(t, l2)
+
+	checkStreamMsgs := func(js nats.JetStreamContext, stream string, expected uint64) {
+		t.Helper()
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+			si, err := js.StreamInfo(stream)
+			if err != nil {
+				return err
+			}
+			if si.State.Msgs != expected {
+				return fmt.Errorf("Expected %v messages, got %v", expected, si.State.Msgs)
+			}
+			return nil
+		})
+	}
+
+	sendToStreamTest := func(js nats.JetStreamContext) {
+		t.Helper()
+		for i := 0; i < 10; i++ {
+			_, err = js.Publish("test", []byte("hello"))
+			require_NoError(t, err)
+		}
+	}
+
+	nca, jsa := jsClientConnect(t, l1)
+	defer nca.Close()
+	_, err = jsa.AddStream(&nats.StreamConfig{Name: "queue", Subjects: []string{"queue"}})
+	require_NoError(t, err)
+
+	ncb, jsb := jsClientConnect(t, l2)
+	defer ncb.Close()
+	_, err = jsb.AddStream(&nats.StreamConfig{Name: "test", Subjects: []string{"test"}})
+	require_NoError(t, err)
+	sendToStreamTest(jsb)
+	checkStreamMsgs(jsb, "test", 10)
+
+	// Add test as source to queue
+	si, err := jsa.UpdateStream(&nats.StreamConfig{
+		Name:     "queue",
+		Subjects: []string{"queue"},
+		Sources: []*nats.StreamSource{
+			{
+				Name: "test",
+				External: &nats.ExternalStream{
+					APIPrefix: "$JS.b-leaf.API",
+				},
+			},
+		},
+	})
+	require_NoError(t, err)
+	require_True(t, len(si.Config.Sources) == 1)
+	checkStreamMsgs(jsa, "queue", 10)
+
+	// add more entries to "test"
+	sendToStreamTest(jsb)
+
+	// verify entries are both in "test" and "queue"
+	checkStreamMsgs(jsb, "test", 20)
+	checkStreamMsgs(jsa, "queue", 20)
+
+	// Remove source
+	si, err = jsa.UpdateStream(&nats.StreamConfig{
+		Name:     "queue",
+		Subjects: []string{"queue"},
+	})
+	require_NoError(t, err)
+	require_True(t, len(si.Config.Sources) == 0)
+
+	// add more entries to "test"
+	sendToStreamTest(jsb)
+	// verify entries are in "test"
+	checkStreamMsgs(jsb, "test", 30)
+
+	// But they should not be in "queue". We will wait a bit before checking
+	// to make sure that we are letting enough time for the sourcing to
+	// incorrectly happen if there is a bug.
+	time.Sleep(250 * time.Millisecond)
+	checkStreamMsgs(jsa, "queue", 20)
+
+	// Restart leaf "a"
+	nca.Close()
+	l1.Shutdown()
+	l1 = RunServer(&lo1)
+	defer l1.Shutdown()
+
+	// add more entries to "test"
+	sendToStreamTest(jsb)
+	checkStreamMsgs(jsb, "test", 40)
+
+	nca, jsa = jsClientConnect(t, l1)
+	defer nca.Close()
+	time.Sleep(250 * time.Millisecond)
+	checkStreamMsgs(jsa, "queue", 20)
 }
 
 ///////////////////////////////////////////////////////////////////////////

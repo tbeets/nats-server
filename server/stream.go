@@ -367,7 +367,7 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 	c := s.createInternalJetStreamClient()
 	ic := s.createInternalJetStreamClient()
 
-	qname := fmt.Sprintf("Stream %s > %s messages", a.Name, config.Name)
+	qpfx := fmt.Sprintf("[ACC:%s] stream '%s' ", a.Name, config.Name)
 	mset := &stream{
 		acc:       a,
 		jsa:       jsa,
@@ -378,13 +378,13 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 		sysc:      ic,
 		stype:     cfg.Storage,
 		consumers: make(map[string]*consumer),
-		msgs:      newIPQueue(ipQueue_Logger(qname, s.ipqLog)), // of *inMsg
+		msgs:      s.newIPQueue(qpfx + "messages"), // of *inMsg
 		qch:       make(chan struct{}),
 	}
 
 	// For no-ack consumers when we are interest retention.
 	if cfg.Retention != LimitsPolicy {
-		mset.ackq = newIPQueue() // of uint64
+		mset.ackq = s.newIPQueue(qpfx + "acks") // of uint64
 	}
 
 	jsa.streams[cfg.Name] = mset
@@ -969,8 +969,34 @@ func (jsa *jsAccount) configUpdateCheck(old, new *StreamConfig) (*StreamConfig, 
 		cfg.AllowRollup = false
 	}
 
-	// Check limits.
-	if err := jsa.checkAllLimits(&cfg); err != nil {
+	// Check limits. We need some extra handling to allow updating MaxBytes.
+
+	// First, let's calculate the difference between the new and old MaxBytes.
+	maxBytesDiff := cfg.MaxBytes - old.MaxBytes
+	if maxBytesDiff < 0 {
+		// If we're updating to a lower MaxBytes (maxBytesDiff is negative),
+		// then set to zero so checkBytesLimits doesn't set addBytes to 1.
+		maxBytesDiff = 0
+	}
+	// If maxBytesDiff == 0, then that means MaxBytes didn't change.
+	// If maxBytesDiff > 0, then we want to reserve additional bytes.
+
+	// Save the user configured MaxBytes.
+	newMaxBytes := cfg.MaxBytes
+
+	// We temporarily set cfg.MaxBytes to maxBytesDiff because checkAllLimits
+	// adds cfg.MaxBytes to the current reserved limit and checks if we've gone
+	// over. However, we don't want an addition cfg.MaxBytes, we only want to
+	// reserve the difference between the new and the old values.
+	cfg.MaxBytes = maxBytesDiff
+
+	// Check if we can reserve the additional difference.
+	err = jsa.checkAllLimits(&cfg)
+
+	// Restore the user configured MaxBytes.
+	cfg.MaxBytes = newMaxBytes
+
+	if err != nil {
 		return nil, err
 	}
 	return &cfg, nil
@@ -1022,7 +1048,7 @@ func (mset *stream) update(config *StreamConfig) error {
 		if len(cfg.Sources) > 0 || len(ocfg.Sources) > 0 {
 			current := make(map[string]struct{})
 			for _, s := range ocfg.Sources {
-				current[s.Name] = struct{}{}
+				current[s.iname] = struct{}{}
 			}
 			for _, s := range cfg.Sources {
 				s.setIndexName()
@@ -1031,7 +1057,8 @@ func (mset *stream) update(config *StreamConfig) error {
 						mset.sources = make(map[string]*sourceInfo)
 					}
 					mset.cfg.Sources = append(mset.cfg.Sources, s)
-					si := &sourceInfo{name: s.Name, iname: s.iname, msgs: newIPQueue() /* of *inMsg */}
+					qname := fmt.Sprintf("[ACC:%s] stream source '%s' from '%s' msgs", mset.acc.Name, mset.cfg.Name, s.Name)
+					si := &sourceInfo{name: s.Name, iname: s.iname, msgs: mset.srv.newIPQueue(qname) /* of *inMsg */}
 					mset.sources[s.iname] = si
 					mset.setStartingSequenceForSource(s.iname)
 					mset.setSourceConsumer(s.iname, si.sseq+1)
@@ -1046,6 +1073,8 @@ func (mset *stream) update(config *StreamConfig) error {
 		}
 	}
 
+	js := mset.js
+
 	// Now update config and store's version of our config.
 	mset.cfg = *cfg
 
@@ -1054,6 +1083,23 @@ func (mset *stream) update(config *StreamConfig) error {
 		mset.sendUpdateAdvisoryLocked()
 	}
 	mset.mu.Unlock()
+
+	if js != nil {
+		maxBytesDiff := cfg.MaxBytes - ocfg.MaxBytes
+		if maxBytesDiff > 0 {
+			// Reserve the difference
+			js.reserveStreamResources(&StreamConfig{
+				MaxBytes: maxBytesDiff,
+				Storage:  cfg.Storage,
+			})
+		} else if maxBytesDiff < 0 {
+			// Release the difference
+			js.releaseStreamResources(&StreamConfig{
+				MaxBytes: -maxBytesDiff,
+				Storage:  ocfg.Storage,
+			})
+		}
+	}
 
 	mset.store.UpdateConfig(cfg)
 
@@ -1610,7 +1656,8 @@ func (mset *stream) setupMirrorConsumer() error {
 	}
 
 	if !isReset {
-		mset.mirror = &sourceInfo{name: mset.cfg.Mirror.Name, msgs: newIPQueue() /* of *inMsg */}
+		qname := fmt.Sprintf("[ACC:%s] stream mirror '%s' of '%s' msgs", mset.acc.Name, mset.cfg.Name, mset.cfg.Mirror.Name)
+		mset.mirror = &sourceInfo{name: mset.cfg.Mirror.Name, msgs: mset.srv.newIPQueue(qname) /* of *inMsg */}
 	}
 
 	if !mset.mirror.grr {
@@ -2228,7 +2275,8 @@ func (mset *stream) startingSequenceForSources() {
 		if ssi.iname == _EMPTY_ {
 			ssi.setIndexName()
 		}
-		si := &sourceInfo{name: ssi.Name, iname: ssi.iname, msgs: newIPQueue() /* of *inMsg */}
+		qname := fmt.Sprintf("[ACC:%s] stream source '%s' from '%s' msgs", mset.acc.Name, mset.cfg.Name, ssi.Name)
+		si := &sourceInfo{name: ssi.Name, iname: ssi.iname, msgs: mset.srv.newIPQueue(qname) /* of *inMsg */}
 		mset.sources[ssi.iname] = si
 	}
 
@@ -2342,6 +2390,7 @@ func (mset *stream) stopSourceConsumers() {
 			close(si.qch)
 			si.qch = nil
 		}
+		si.msgs.unregister()
 	}
 }
 
@@ -2368,6 +2417,7 @@ func (mset *stream) unsubscribeToStream() error {
 		if mset.mirror.qch != nil {
 			close(mset.mirror.qch)
 		}
+		mset.mirror.msgs.unregister()
 		mset.mirror = nil
 	}
 
@@ -3141,8 +3191,8 @@ func (mset *stream) setupSendCapabilities() {
 	if mset.outq != nil {
 		return
 	}
-	qname := fmt.Sprintf("Stream %q send", mset.cfg.Name)
-	mset.outq = &jsOutQ{newIPQueue(ipQueue_Logger(qname, mset.srv.ipqLog))} // of *jsPubMsg
+	qname := fmt.Sprintf("[ACC:%s] stream '%s' sendQ", mset.acc.Name, mset.cfg.Name)
+	mset.outq = &jsOutQ{mset.srv.newIPQueue(qname)} // of *jsPubMsg
 	go mset.internalLoop()
 }
 
@@ -3367,6 +3417,14 @@ func (mset *stream) stop(deleteFlag, advisory bool) error {
 
 	sysc := mset.sysc
 	mset.sysc = nil
+
+	if deleteFlag {
+		// Unregistering ipQueues do not prevent them from push/pop
+		// just will remove them from the central monitoring map
+		mset.msgs.unregister()
+		mset.ackq.unregister()
+		mset.outq.unregister()
+	}
 
 	// Clustered cleanup.
 	mset.mu.Unlock()

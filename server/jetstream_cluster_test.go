@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"math/rand"
@@ -669,7 +670,7 @@ func TestJetStreamClusterConsumerState(t *testing.T) {
 
 	// Pull 5 messages and ack.
 	for _, m := range fetchMsgs(t, sub, 5, 5*time.Second) {
-		m.Ack()
+		m.AckSync()
 	}
 
 	// Let state propagate for exact comparison below.
@@ -703,7 +704,7 @@ func TestJetStreamClusterConsumerState(t *testing.T) {
 	// Now make sure we can receive new messages.
 	// Pull last 5.
 	for _, m := range fetchMsgs(t, sub, 5, 5*time.Second) {
-		m.Ack()
+		m.AckSync()
 	}
 
 	nci, _ = sub.ConsumerInfo()
@@ -967,7 +968,7 @@ func TestJetStreamClusterRestoreSingleConsumer(t *testing.T) {
 	if m, err := sub.NextMsg(time.Second); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	} else {
-		m.Ack()
+		m.AckSync()
 	}
 
 	c.stopAll()
@@ -1075,7 +1076,7 @@ func TestJetStreamClusterStreamPublishWithActiveConsumers(t *testing.T) {
 	if m, err := sub.NextMsg(time.Second); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	} else {
-		m.Ack()
+		m.AckSync()
 	}
 
 	// Send 10 messages.
@@ -1300,7 +1301,7 @@ func TestJetStreamClusterConsumerInfoList(t *testing.T) {
 	} {
 		msgs := fetchMsgs(t, ss.sub, ss.fetch, 5*time.Second)
 		for i := 0; i < ss.ack; i++ {
-			msgs[i].Ack()
+			msgs[i].AckSync()
 		}
 	}
 
@@ -2059,7 +2060,7 @@ func TestJetStreamClusterInterestRetention(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unexpected error getting msg: %v", err)
 	}
-	m.Ack()
+	m.AckSync()
 
 	waitForZero := func() {
 		checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
@@ -2130,7 +2131,7 @@ func TestJetStreamClusterWorkQueueRetention(t *testing.T) {
 
 	// Fetch from our pull consumer and ack.
 	for _, m := range fetchMsgs(t, sub, 1, 5*time.Second) {
-		m.Ack()
+		m.AckSync()
 	}
 
 	// Make sure the messages are removed.
@@ -2327,7 +2328,7 @@ func TestJetStreamClusterInterestRetentionWithFilteredConsumers(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Unexpected error getting msg: %v", err)
 		}
-		m.Ack()
+		m.AckSync()
 	}
 
 	jsq, err := nc.JetStream(nats.MaxWait(250 * time.Millisecond))
@@ -2610,12 +2611,12 @@ func TestJetStreamClusterUserSnapshotAndRestore(t *testing.T) {
 	}
 	// Ack first 50.
 	for _, m := range fetchMsgs(t, jsub, 50, 5*time.Second) {
-		m.Ack()
+		m.AckSync()
 	}
 	// Now ack every third message for next 50.
 	for i, m := range fetchMsgs(t, jsub, 50, 5*time.Second) {
 		if i%3 == 0 {
-			m.Ack()
+			m.AckSync()
 		}
 	}
 	nc.Flush()
@@ -2785,7 +2786,7 @@ func TestJetStreamClusterUserSnapshotAndRestore(t *testing.T) {
 		if meta.Sequence.Stream != uint64(wantSeq) {
 			t.Fatalf("Expected stream sequence of %d, but got %d", wantSeq, meta.Sequence.Stream)
 		}
-		m.Ack()
+		m.AckSync()
 		wantSeq++
 	}
 
@@ -3989,7 +3990,7 @@ func TestJetStreamClusterNoDuplicateOnNodeRestart(t *testing.T) {
 	if m, err := sub.NextMsg(time.Second); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	} else {
-		m.Ack()
+		m.AckSync()
 	}
 
 	sl := c.streamLeader("$G", "TEST")
@@ -4006,7 +4007,7 @@ func TestJetStreamClusterNoDuplicateOnNodeRestart(t *testing.T) {
 	if string(msg.Data) != "msg2" {
 		t.Fatalf("Unexpected message: %s", msg.Data)
 	}
-	msg.Ack()
+	msg.AckSync()
 
 	// Make sure we don't get a duplicate.
 	msg, err = sub.NextMsg(250 * time.Millisecond)
@@ -8243,7 +8244,7 @@ func TestJetStreamPanicDecodingConsumerState(t *testing.T) {
 			t.Fatalf("Failed to fetch message: %v", err)
 		}
 		for _, m := range msgs {
-			m.Ack()
+			m.AckSync()
 			total++
 		}
 	}
@@ -8270,7 +8271,7 @@ func TestJetStreamPanicDecodingConsumerState(t *testing.T) {
 			t.Fatalf("Error on fetch: %v", err)
 		}
 		for _, m := range msgs {
-			m.Ack()
+			m.AckSync()
 			total++
 		}
 	}
@@ -8319,7 +8320,7 @@ func TestJetStreamPullConsumerLeakedSubs(t *testing.T) {
 			t.Fatalf("Unexpected error: %v", err)
 		}
 		for _, m := range msgs {
-			m.Ack()
+			m.AckSync()
 		}
 	}
 
@@ -9698,7 +9699,7 @@ func TestJetStreamConsumerUpdates(t *testing.T) {
 			m, err := sub.NextMsg(time.Second)
 			require_NoError(t, err)
 			if i >= 10 {
-				m.Ack()
+				m.AckSync()
 			}
 		}
 
@@ -10076,7 +10077,7 @@ func TestJetStreamClusterPullPerf(t *testing.T) {
 			done <- true
 		}
 		if r%750 == 0 {
-			m.Ack()
+			m.AckSync()
 		}
 	})
 	require_NoError(t, err)
@@ -10809,7 +10810,7 @@ func TestJetStreamClusterInterestRetentionWithFilteredConsumersExtra(t *testing.
 		require_NoError(t, err)
 
 		for _, m := range msgs {
-			err = m.Ack()
+			err = m.AckSync()
 			require_NoError(t, err)
 			successCounter++
 		}
@@ -11106,6 +11107,209 @@ func TestJetStreamStreamAdvisories(t *testing.T) {
 	t.Run("Single", func(t *testing.T) { checkAdvisories(t, s, 1) })
 	t.Run("Clustered_R1", func(t *testing.T) { checkAdvisories(t, c.randomServer(), 1) })
 	t.Run("Clustered_R3", func(t *testing.T) { checkAdvisories(t, c.randomServer(), 3) })
+}
+
+func TestJetStreamRemovedPeersAndStreamsListAndDelete(t *testing.T) {
+	sc := createJetStreamSuperCluster(t, 3, 3)
+	defer sc.shutdown()
+
+	pcn := "C2"
+	sc.waitOnLeader()
+	ml := sc.leader()
+	if ml.ClusterName() == pcn {
+		pcn = "C1"
+	}
+
+	// Client based API
+	nc, js := jsClientConnect(t, ml)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:      "GONE",
+		Replicas:  3,
+		Placement: &nats.Placement{Cluster: pcn},
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("GONE", &nats.ConsumerConfig{Durable: "dlc", AckPolicy: nats.AckExplicitPolicy})
+	require_NoError(t, err)
+
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:      "TEST",
+		Replicas:  3,
+		Placement: &nats.Placement{Cluster: ml.ClusterName()},
+	})
+	require_NoError(t, err)
+
+	// Put messages in..
+	num := 100
+	for i := 0; i < num; i++ {
+		js.PublishAsync("GONE", []byte("SLS"))
+		js.PublishAsync("TEST", []byte("SLS"))
+	}
+	select {
+	case <-js.PublishAsyncComplete():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Did not receive completion signal")
+	}
+
+	c := sc.clusterForName(pcn)
+	c.shutdown()
+
+	// Grab Stream List..
+	start := time.Now()
+	resp, err := nc.Request(JSApiStreamList, nil, 2*time.Second)
+	require_NoError(t, err)
+	if delta := time.Since(start); delta > 100*time.Millisecond {
+		t.Fatalf("Stream list call took too long to return: %v", delta)
+	}
+	var list JSApiStreamListResponse
+	err = json.Unmarshal(resp.Data, &list)
+	require_NoError(t, err)
+
+	if len(list.Missing) != 1 || list.Missing[0] != "GONE" {
+		t.Fatalf("Wrong Missing: %+v", list)
+	}
+
+	// Check behavior of stream info as well. We want it to return the stream is offline and not just timeout.
+	_, err = js.StreamInfo("GONE")
+	// FIXME(dlc) - Go client not putting nats: prefix on for stream but does for consumer.
+	require_Error(t, err, NewJSStreamOfflineError())
+
+	// Same for Consumer
+	start = time.Now()
+	resp, err = nc.Request("$JS.API.CONSUMER.LIST.GONE", nil, 2*time.Second)
+	require_NoError(t, err)
+	if delta := time.Since(start); delta > 100*time.Millisecond {
+		t.Fatalf("Consumer list call took too long to return: %v", delta)
+	}
+	var clist JSApiConsumerListResponse
+	err = json.Unmarshal(resp.Data, &clist)
+	require_NoError(t, err)
+
+	if len(clist.Missing) != 1 || clist.Missing[0] != "dlc" {
+		t.Fatalf("Wrong Missing: %+v", clist)
+	}
+
+	_, err = js.ConsumerInfo("GONE", "dlc")
+	require_Error(t, err, NewJSConsumerOfflineError(), errors.New("nats: consumer is offline"))
+
+	// Make sure delete works.
+	err = js.DeleteConsumer("GONE", "dlc")
+	require_NoError(t, err)
+
+	err = js.DeleteStream("GONE")
+	require_NoError(t, err)
+
+	// Test it is really gone.
+	_, err = js.StreamInfo("GONE")
+	require_Error(t, err, nats.ErrStreamNotFound)
+}
+
+func TestJetStreamConsumerDeliverNewBug(t *testing.T) {
+	sc := createJetStreamSuperCluster(t, 3, 3)
+	defer sc.shutdown()
+
+	pcn := "C2"
+	sc.waitOnLeader()
+	ml := sc.leader()
+	if ml.ClusterName() == pcn {
+		pcn = "C1"
+	}
+
+	// Client based API
+	nc, js := jsClientConnect(t, ml)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:      "T",
+		Replicas:  3,
+		Placement: &nats.Placement{Cluster: pcn},
+	})
+	require_NoError(t, err)
+
+	// Put messages in..
+	num := 200
+	for i := 0; i < num; i++ {
+		js.PublishAsync("T", []byte("OK"))
+	}
+	select {
+	case <-js.PublishAsyncComplete():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Did not receive completion signal")
+	}
+
+	ci, err := js.AddConsumer("T", &nats.ConsumerConfig{
+		Durable:       "d",
+		AckPolicy:     nats.AckExplicitPolicy,
+		DeliverPolicy: nats.DeliverNewPolicy,
+	})
+	require_NoError(t, err)
+
+	if ci.Delivered.Consumer != 0 || ci.Delivered.Stream != 200 {
+		t.Fatalf("Incorrect consumer delivered info: %+v", ci.Delivered)
+	}
+
+	c := sc.clusterForName(pcn)
+	for _, s := range c.servers {
+		sd := s.JetStreamConfig().StoreDir
+		s.Shutdown()
+		removeDir(t, sd)
+		s = c.restartServer(s)
+		c.waitOnServerHealthz(s)
+	}
+
+	c.waitOnConsumerLeader("$G", "T", "d")
+	ci, err = js.ConsumerInfo("T", "d")
+	require_NoError(t, err)
+
+	if ci.Delivered.Consumer != 0 || ci.Delivered.Stream != 200 {
+		t.Fatalf("Incorrect consumer delivered info: %+v", ci.Delivered)
+	}
+	if ci.NumPending != 0 {
+		t.Fatalf("Did not expect NumPending, got %d", ci.NumPending)
+	}
+}
+
+// If the config files have duplicate routes this can have the metagroup estimate a size for the system
+// which prevents reaching quorum and electing a meta-leader.
+func TestJetStreamDuplicateRoutesDisruptJetStreamMetaGroup(t *testing.T) {
+	tmpl := `
+	listen: 127.0.0.1:-1
+	server_name: %s
+	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+
+	cluster {
+		name: RR
+		listen: 127.0.0.1:%d
+		routes = [
+			nats-route://127.0.0.1:%d
+			nats-route://127.0.0.1:%d
+			nats-route://127.0.0.1:%d
+			# These will be dupes
+			nats-route://127.0.0.1:%d
+			nats-route://127.0.0.1:%d
+			nats-route://127.0.0.1:%d
+		]
+	}
+
+	# For access to system account.
+	accounts { $SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] } }
+`
+
+	c := &cluster{servers: make([]*Server, 0, 3), opts: make([]*Options, 0, 3), name: "RR", t: t}
+
+	rports := []int{22208, 22209, 22210}
+	for i, p := range rports {
+		sname, sd := fmt.Sprintf("S%d", i+1), createDir(t, JetStreamStoreDir)
+		cf := fmt.Sprintf(tmpl, sname, sd, p, rports[0], rports[1], rports[2], rports[0], rports[1], rports[2])
+		s, o := RunServerWithConfig(createConfFile(t, []byte(cf)))
+		c.servers, c.opts = append(c.servers, s), append(c.opts, o)
+	}
+	defer c.shutdown()
+
+	checkClusterFormed(t, c.servers...)
+	c.waitOnClusterReady()
 }
 
 // Support functions
@@ -12045,6 +12249,19 @@ func (c *cluster) waitOnStreamCurrent(s *Server, account, stream string) {
 	c.t.Fatalf("Expected server %q to eventually be current for stream %q", s, stream)
 }
 
+func (c *cluster) waitOnServerHealthz(s *Server) {
+	c.t.Helper()
+	expires := time.Now().Add(30 * time.Second)
+	for time.Now().Before(expires) {
+		hs := s.healthz()
+		if hs.Status == "ok" && hs.Error == _EMPTY_ {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	c.t.Fatalf("Expected server %q to eventually return healthz 'ok', but got %q", s, s.healthz().Error)
+}
+
 func (c *cluster) waitOnServerCurrent(s *Server) {
 	c.t.Helper()
 	expires := time.Now().Add(20 * time.Second)
@@ -12140,6 +12357,10 @@ func (c *cluster) waitOnClusterReadyWithNumPeers(numPeersExpected int) {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+
+	if leader == nil {
+		c.t.Fatalf("Failed to elect a meta-leader")
 	}
 
 	peersSeen := len(leader.JetStreamClusterPeers())
