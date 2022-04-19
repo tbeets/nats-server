@@ -202,6 +202,7 @@ const (
 	DuplicateRemoteLeafnodeConnection
 	DuplicateClientID
 	DuplicateServerName
+	MinimumVersionRequired
 )
 
 // Some flags passed to processMsgResults
@@ -1226,6 +1227,15 @@ func (c *client) readLoop(pre []byte) {
 		// to process messages, etc.
 		for i := 0; i < len(bufs); i++ {
 			if err := c.parse(bufs[i]); err != nil {
+				if err == ErrMinimumVersionRequired {
+					// Special case here, currently only for leaf node connections.
+					// When process the CONNECT protocol, if the minimum version
+					// required was not met, an error was printed and sent back to
+					// the remote, and connection was closed after a certain delay
+					// (to avoid "rapid" reconnection from the remote).
+					// We don't need to do any of the things below, simply return.
+					return
+				}
 				if dur := time.Since(start); dur >= readLoopReportThreshold {
 					c.Warnf("Readloop processing time: %v", dur)
 				}
@@ -2922,21 +2932,26 @@ func (c *client) checkDenySub(subject string) bool {
 // Create a message header for routes or leafnodes. Header and origin cluster aware.
 func (c *client) msgHeaderForRouteOrLeaf(subj, reply []byte, rt *routeTarget, acc *Account) []byte {
 	hasHeader := c.pa.hdr > 0
-	canReceiveHeader := rt.sub.client.headers
+	subclient := rt.sub.client
+	canReceiveHeader := subclient.headers
 
 	mh := c.msgb[:msgHeadProtoLen]
-	kind := rt.sub.client.kind
+	kind := subclient.kind
 	var lnoc bool
 
 	if kind == ROUTER {
 		// If we are coming from a leaf with an origin cluster we need to handle differently
 		// if we can. We will send a route based LMSG which has origin cluster and headers
 		// by default.
-		if c.kind == LEAF && c.remoteCluster() != _EMPTY_ && rt.sub.client.route.lnoc {
+		if c.kind == LEAF && c.remoteCluster() != _EMPTY_ {
+			subclient.mu.Lock()
+			lnoc = subclient.route.lnoc
+			subclient.mu.Unlock()
+		}
+		if lnoc {
 			mh[0] = 'L'
 			mh = append(mh, c.remoteCluster()...)
 			mh = append(mh, ' ')
-			lnoc = true
 		} else {
 			// Router (and Gateway) nodes are RMSG. Set here since leafnodes may rewrite.
 			mh[0] = 'R'
@@ -3478,8 +3493,11 @@ func isReservedReply(reply []byte) bool {
 	if isServiceReply(reply) {
 		return true
 	}
+	rLen := len(reply)
 	// Faster to check with string([:]) than byte-by-byte
-	if len(reply) > gwReplyPrefixLen && string(reply[:gwReplyPrefixLen]) == gwReplyPrefix {
+	if rLen > jsAckPreLen && string(reply[:jsAckPreLen]) == jsAckPre {
+		return true
+	} else if rLen > gwReplyPrefixLen && string(reply[:gwReplyPrefixLen]) == gwReplyPrefix {
 		return true
 	}
 	return false
@@ -4088,11 +4106,13 @@ func (c *client) processMsgResults(acc *Account, r *SublistResult, msg, deliver,
 
 	// Check for JetStream encoded reply subjects.
 	// For now these will only be on $JS.ACK prefixed reply subjects.
+	var remapped bool
 	if len(creply) > 0 &&
 		c.kind != CLIENT && c.kind != SYSTEM && c.kind != JETSTREAM && c.kind != ACCOUNT &&
 		bytes.HasPrefix(creply, []byte(jsAckPre)) {
 		// We need to rewrite the subject and the reply.
 		if li := bytes.LastIndex(creply, []byte("@")); li != -1 && li < len(creply)-1 {
+			remapped = true
 			subj, creply = creply[li+1:], creply[:li]
 		}
 	}
@@ -4145,6 +4165,11 @@ func (c *client) processMsgResults(acc *Account, r *SublistResult, msg, deliver,
 				dsubj = append(_dsubj[:0], subj...)
 			} else {
 				dsubj = append(_dsubj[:0], sub.im.to...)
+			}
+
+			// Make sure deliver is set if inbound from a route. (leaf is fixed on send)
+			if remapped && (c.kind == GATEWAY || c.kind == ROUTER) {
+				deliver = subj
 			}
 			// If we are mapping for a deliver subject we will reverse roles.
 			// The original subj we set from above is correct for the msg header,
@@ -5318,6 +5343,15 @@ func (c *client) Tracef(format string, v ...interface{}) {
 func (c *client) Warnf(format string, v ...interface{}) {
 	format = fmt.Sprintf("%s - %s", c, format)
 	c.srv.Warnf(format, v...)
+}
+
+func (c *client) RateLimitWarnf(format string, v ...interface{}) {
+	// Do the check before adding the client info to the format...
+	statement := fmt.Sprintf(format, v...)
+	if _, loaded := c.srv.rateLimitLogging.LoadOrStore(statement, time.Now()); loaded {
+		return
+	}
+	c.Warnf("%s", statement)
 }
 
 // Set the very first PING to a lower interval to capture the initial RTT.

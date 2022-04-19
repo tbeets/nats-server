@@ -691,6 +691,9 @@ func (s *Server) sendStatsz(subj string) {
 			ni := v.(nodeInfo)
 			ni.stats = jStat.Stats
 			ni.cfg = jStat.Config
+			s.optsMu.RLock()
+			ni.tags = copyStrings(s.opts.Tags)
+			s.optsMu.RUnlock()
 			s.nodeToInfo.Store(ourNode, ni)
 		}
 		// Metagroup info.
@@ -1010,8 +1013,8 @@ func (s *Server) addSystemAccountExports(sacc *Account) {
 	if err := sacc.AddServiceExport(accSubsSubj, nil); err != nil {
 		s.Errorf("Error adding system service export for %q: %v", accSubsSubj, err)
 	}
-
-	if s.JetStreamEnabled() {
+	// in case of a mixed mode setup, enable js exports anyway
+	if s.JetStreamEnabled() || !s.standAloneMode() {
 		s.checkJetStreamExports()
 	}
 }
@@ -1574,12 +1577,12 @@ func (s *Server) registerSystemImports(a *Account) {
 
 	// Add in this to the account in 2 places.
 	// "$SYS.REQ.SERVER.PING.CONNZ" and "$SYS.REQ.ACCOUNT.PING.CONNZ"
-	if _, ok := a.imports.services[connzSubj]; !ok {
+	if !a.serviceImportExists(connzSubj) {
 		if err := a.AddServiceImport(sacc, connzSubj, mappedSubj); err != nil {
 			s.Errorf("Error setting up system service imports for account: %v", err)
 		}
 	}
-	if _, ok := a.imports.services[accConnzReqSubj]; !ok {
+	if !a.serviceImportExists(accConnzReqSubj) {
 		if err := a.AddServiceImport(sacc, accConnzReqSubj, mappedSubj); err != nil {
 			s.Errorf("Error setting up system service imports for account: %v", err)
 		}

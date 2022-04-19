@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"math/rand"
@@ -1084,7 +1085,7 @@ func TestConnzSortedByStopTimeClosedConn(t *testing.T) {
 	}
 	checkClosedConns(t, s, 4, time.Second)
 
-	//Now adjust the Stop times for these with some random values.
+	// Now adjust the Stop times for these with some random values.
 	s.mu.Lock()
 	now := time.Now().UTC()
 	ccs := s.closed.closedClients()
@@ -1129,7 +1130,7 @@ func TestConnzSortedByReason(t *testing.T) {
 	}
 	checkClosedConns(t, s, 20, time.Second)
 
-	//Now adjust the Reasons for these with some random values.
+	// Now adjust the Reasons for these with some random values.
 	s.mu.Lock()
 	ccs := s.closed.closedClients()
 	max := int(ServerShutdown)
@@ -3980,6 +3981,31 @@ func checkForJSClusterUp(t *testing.T, servers ...*Server) {
 	})
 }
 
+func TestMonitorJszNonJszServer(t *testing.T) {
+	srv := RunServer(DefaultOptions())
+	defer srv.Shutdown()
+
+	if !srv.ReadyForConnections(5 * time.Second) {
+		t.Fatalf("server did not become ready")
+	}
+
+	jsi, err := srv.Jsz(&JSzOptions{})
+	if err != nil {
+		t.Fatalf("jsi failed: %v", err)
+	}
+	if jsi.ID != srv.ID() {
+		t.Fatalf("did not receive valid info")
+	}
+
+	jsi, err = srv.Jsz(&JSzOptions{LeaderOnly: true})
+	if !errors.Is(err, errSkipZreq) {
+		t.Fatalf("expected a skip z req error: %v", err)
+	}
+	if jsi != nil {
+		t.Fatalf("expected no jsi: %v", jsi)
+	}
+}
+
 func TestMonitorJsz(t *testing.T) {
 	readJsInfo := func(url string) *JSInfo {
 		t.Helper()
@@ -4231,6 +4257,24 @@ func TestMonitorJsz(t *testing.T) {
 			t.Fatal("ReplicationLag expected to be present for my-stream-mirror stream")
 		}
 	})
+	t.Run("cluster-info", func(t *testing.T) {
+		found := 0
+		for i, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "")
+			if info.Meta.Replicas != nil {
+				found++
+				if info.Meta.Leader != srvs[i].Name() {
+					t.Fatalf("received cluster info from non leader: leader %s, server: %s", info.Meta.Leader, srvs[i].Name())
+				}
+			}
+		}
+		if found == 0 {
+			t.Fatalf("did not receive cluster info from any node")
+		}
+		if found > 1 {
+			t.Fatalf("received cluster info from multiple nodes")
+		}
+	})
 	t.Run("account-non-existing", func(t *testing.T) {
 		for _, url := range []string{monUrl1, monUrl2} {
 			info := readJsInfo(url + "?acc=DOES_NOT_EXIT")
@@ -4249,6 +4293,10 @@ func TestMonitorReloadTLSConfig(t *testing.T) {
 			cert_file: '%s'
 			key_file: '%s'
 			ca_file: '../test/configs/certs/ca.pem'
+
+			# Set this to make sure that it does not impact secure monitoring
+			# (which it did, see issue: https://github.com/nats-io/nats-server/issues/2980)
+			verify_and_map: true
 		}
 	`
 	conf := createConfFile(t, []byte(fmt.Sprintf(template,
@@ -4293,5 +4341,111 @@ func TestMonitorReloadTLSConfig(t *testing.T) {
 	c = tls.Client(c, tlsConfig.Clone())
 	if err := c.(*tls.Conn).Handshake(); err != nil {
 		t.Fatalf("Error on TLS handshake: %v", err)
+	}
+
+	// Need to read something to see if there is a problem with the certificate or not.
+	var buf [64]byte
+	c.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+	_, err = c.Read(buf[:])
+	if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+		t.Fatalf("Error: %v", err)
+	}
+}
+
+func TestMonitorMQTT(t *testing.T) {
+	o := DefaultOptions()
+	o.HTTPHost = "127.0.0.1"
+	o.HTTPPort = -1
+	o.ServerName = "mqtt_server"
+	o.Users = []*User{{Username: "someuser"}}
+	pinnedCerts := make(PinnedCertSet)
+	pinnedCerts["7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069"] = struct{}{}
+	o.MQTT = MQTTOpts{
+		Host:           "127.0.0.1",
+		Port:           -1,
+		NoAuthUser:     "someuser",
+		JsDomain:       "js",
+		AuthTimeout:    2.0,
+		TLSMap:         true,
+		TLSTimeout:     3.0,
+		TLSPinnedCerts: pinnedCerts,
+		AckWait:        4 * time.Second,
+		MaxAckPending:  256,
+	}
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	expected := &MQTTOptsVarz{
+		Host:           "127.0.0.1",
+		Port:           o.MQTT.Port,
+		NoAuthUser:     "someuser",
+		JsDomain:       "js",
+		AuthTimeout:    2.0,
+		TLSMap:         true,
+		TLSTimeout:     3.0,
+		TLSPinnedCerts: []string{"7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069"},
+		AckWait:        4 * time.Second,
+		MaxAckPending:  256,
+	}
+	url := fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port)
+	for mode := 0; mode < 2; mode++ {
+		v := pollVarz(t, s, mode, url, nil)
+		vm := &v.MQTT
+		if !reflect.DeepEqual(vm, expected) {
+			t.Fatalf("Expected\n%+v\nGot:\n%+v", expected, vm)
+		}
+	}
+}
+
+func TestMonitorWebsocket(t *testing.T) {
+	o := DefaultOptions()
+	o.HTTPHost = "127.0.0.1"
+	o.HTTPPort = -1
+	kp, _ := nkeys.FromSeed(oSeed)
+	pub, _ := kp.PublicKey()
+	o.TrustedKeys = []string{pub}
+	o.Users = []*User{{Username: "someuser"}}
+	pinnedCerts := make(PinnedCertSet)
+	pinnedCerts["7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069"] = struct{}{}
+	o.Websocket = WebsocketOpts{
+		Host:             "127.0.0.1",
+		Port:             -1,
+		Advertise:        "somehost:8080",
+		NoAuthUser:       "someuser",
+		JWTCookie:        "somecookiename",
+		AuthTimeout:      2.0,
+		NoTLS:            true,
+		TLSMap:           true,
+		TLSPinnedCerts:   pinnedCerts,
+		SameOrigin:       true,
+		AllowedOrigins:   []string{"origin1", "origin2"},
+		Compression:      true,
+		HandshakeTimeout: 4 * time.Second,
+	}
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	expected := &WebsocketOptsVarz{
+		Host:             "127.0.0.1",
+		Port:             o.Websocket.Port,
+		Advertise:        "somehost:8080",
+		NoAuthUser:       "someuser",
+		JWTCookie:        "somecookiename",
+		AuthTimeout:      2.0,
+		NoTLS:            true,
+		TLSMap:           true,
+		TLSPinnedCerts:   []string{"7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069"},
+		SameOrigin:       true,
+		AllowedOrigins:   []string{"origin1", "origin2"},
+		Compression:      true,
+		HandshakeTimeout: 4 * time.Second,
+	}
+	url := fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port)
+	for mode := 0; mode < 2; mode++ {
+		v := pollVarz(t, s, mode, url, nil)
+		vw := &v.Websocket
+		if !reflect.DeepEqual(vw, expected) {
+			t.Fatalf("Expected\n%+v\nGot:\n%+v", expected, vw)
+		}
 	}
 }

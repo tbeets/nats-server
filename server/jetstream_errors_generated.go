@@ -107,8 +107,14 @@ const (
 	// JSConsumerMaxDeliverBackoffErr max deliver is required to be > length of backoff values
 	JSConsumerMaxDeliverBackoffErr ErrorIdentifier = 10116
 
+	// JSConsumerMaxPendingAckExcessErrF consumer max ack pending exceeds system limit of {limit}
+	JSConsumerMaxPendingAckExcessErrF ErrorIdentifier = 10121
+
 	// JSConsumerMaxPendingAckPolicyRequiredErr consumer requires ack policy for max ack pending
 	JSConsumerMaxPendingAckPolicyRequiredErr ErrorIdentifier = 10082
+
+	// JSConsumerMaxRequestBatchExceededF consumer max request batch exceeds server limit of {limit}
+	JSConsumerMaxRequestBatchExceededF ErrorIdentifier = 10125
 
 	// JSConsumerMaxRequestBatchNegativeErr consumer max request batch needs to be > 0
 	JSConsumerMaxRequestBatchNegativeErr ErrorIdentifier = 10114
@@ -185,7 +191,7 @@ const (
 	// JSMemoryResourcesExceededErr insufficient memory resources available
 	JSMemoryResourcesExceededErr ErrorIdentifier = 10028
 
-	// JSMirrorConsumerSetupFailedErrF Generic mirror consumer setup failure string ({err})
+	// JSMirrorConsumerSetupFailedErrF generic mirror consumer setup failure string ({err})
 	JSMirrorConsumerSetupFailedErrF ErrorIdentifier = 10029
 
 	// JSMirrorMaxMessageSizeTooBigErr stream mirror must have max message size >= source
@@ -200,11 +206,14 @@ const (
 	// JSMirrorWithSubjectFiltersErr stream mirrors can not contain filtered subjects
 	JSMirrorWithSubjectFiltersErr ErrorIdentifier = 10033
 
-	// JSMirrorWithSubjectsErr stream mirrors can not also contain subjects
+	// JSMirrorWithSubjectsErr stream mirrors can not contain subjects
 	JSMirrorWithSubjectsErr ErrorIdentifier = 10034
 
 	// JSNoAccountErr account not found
 	JSNoAccountErr ErrorIdentifier = 10035
+
+	// JSNoLimitsErr no JetStream default or applicable tiered limit present
+	JSNoLimitsErr ErrorIdentifier = 10120
 
 	// JSNoMessageFoundErr no message found
 	JSNoMessageFoundErr ErrorIdentifier = 10037
@@ -281,14 +290,23 @@ const (
 	// JSStreamMaxBytesRequired account requires a stream config to have max bytes set
 	JSStreamMaxBytesRequired ErrorIdentifier = 10113
 
+	// JSStreamMaxStreamBytesExceeded stream max bytes exceeds account limit max stream bytes
+	JSStreamMaxStreamBytesExceeded ErrorIdentifier = 10122
+
 	// JSStreamMessageExceedsMaximumErr message size exceeds maximum allowed
 	JSStreamMessageExceedsMaximumErr ErrorIdentifier = 10054
 
-	// JSStreamMirrorNotUpdatableErr Mirror configuration can not be updated
+	// JSStreamMirrorNotUpdatableErr stream mirror configuration can not be updated
 	JSStreamMirrorNotUpdatableErr ErrorIdentifier = 10055
 
 	// JSStreamMismatchErr stream name in subject does not match request
 	JSStreamMismatchErr ErrorIdentifier = 10056
+
+	// JSStreamMoveAndScaleErr can not move and scale a stream in a single update
+	JSStreamMoveAndScaleErr ErrorIdentifier = 10123
+
+	// JSStreamMoveInProgress stream move already in progress
+	JSStreamMoveInProgress ErrorIdentifier = 10124
 
 	// JSStreamMsgDeleteFailedF Generic message deletion failure error string ({err})
 	JSStreamMsgDeleteFailedF ErrorIdentifier = 10057
@@ -396,7 +414,9 @@ var (
 		JSConsumerInvalidPolicyErrF:                {Code: 400, ErrCode: 10094, Description: "{err}"},
 		JSConsumerInvalidSamplingErrF:              {Code: 400, ErrCode: 10095, Description: "failed to parse consumer sampling configuration: {err}"},
 		JSConsumerMaxDeliverBackoffErr:             {Code: 400, ErrCode: 10116, Description: "max deliver is required to be > length of backoff values"},
+		JSConsumerMaxPendingAckExcessErrF:          {Code: 400, ErrCode: 10121, Description: "consumer max ack pending exceeds system limit of {limit}"},
 		JSConsumerMaxPendingAckPolicyRequiredErr:   {Code: 400, ErrCode: 10082, Description: "consumer requires ack policy for max ack pending"},
+		JSConsumerMaxRequestBatchExceededF:         {Code: 400, ErrCode: 10125, Description: "consumer max request batch exceeds server limit of {limit}"},
 		JSConsumerMaxRequestBatchNegativeErr:       {Code: 400, ErrCode: 10114, Description: "consumer max request batch needs to be > 0"},
 		JSConsumerMaxRequestExpiresToSmall:         {Code: 400, ErrCode: 10115, Description: "consumer max request expires needs to be >= 1ms"},
 		JSConsumerMaxWaitingNegativeErr:            {Code: 400, ErrCode: 10087, Description: "consumer max waiting needs to be positive"},
@@ -427,8 +447,9 @@ var (
 		JSMirrorWithSourcesErr:                     {Code: 400, ErrCode: 10031, Description: "stream mirrors can not also contain other sources"},
 		JSMirrorWithStartSeqAndTimeErr:             {Code: 400, ErrCode: 10032, Description: "stream mirrors can not have both start seq and start time configured"},
 		JSMirrorWithSubjectFiltersErr:              {Code: 400, ErrCode: 10033, Description: "stream mirrors can not contain filtered subjects"},
-		JSMirrorWithSubjectsErr:                    {Code: 400, ErrCode: 10034, Description: "stream mirrors can not also contain subjects"},
+		JSMirrorWithSubjectsErr:                    {Code: 400, ErrCode: 10034, Description: "stream mirrors can not contain subjects"},
 		JSNoAccountErr:                             {Code: 503, ErrCode: 10035, Description: "account not found"},
+		JSNoLimitsErr:                              {Code: 400, ErrCode: 10120, Description: "no JetStream default or applicable tiered limit present"},
 		JSNoMessageFoundErr:                        {Code: 404, ErrCode: 10037, Description: "no message found"},
 		JSNotEmptyRequestErr:                       {Code: 400, ErrCode: 10038, Description: "expected an empty request payload"},
 		JSNotEnabledErr:                            {Code: 503, ErrCode: 10076, Description: "JetStream not enabled"},
@@ -454,9 +475,12 @@ var (
 		JSStreamInvalidExternalDeliverySubjErrF:    {Code: 400, ErrCode: 10024, Description: "stream external delivery prefix {prefix} must not contain wildcards"},
 		JSStreamLimitsErrF:                         {Code: 500, ErrCode: 10053, Description: "{err}"},
 		JSStreamMaxBytesRequired:                   {Code: 400, ErrCode: 10113, Description: "account requires a stream config to have max bytes set"},
+		JSStreamMaxStreamBytesExceeded:             {Code: 400, ErrCode: 10122, Description: "stream max bytes exceeds account limit max stream bytes"},
 		JSStreamMessageExceedsMaximumErr:           {Code: 400, ErrCode: 10054, Description: "message size exceeds maximum allowed"},
-		JSStreamMirrorNotUpdatableErr:              {Code: 400, ErrCode: 10055, Description: "Mirror configuration can not be updated"},
+		JSStreamMirrorNotUpdatableErr:              {Code: 400, ErrCode: 10055, Description: "stream mirror configuration can not be updated"},
 		JSStreamMismatchErr:                        {Code: 400, ErrCode: 10056, Description: "stream name in subject does not match request"},
+		JSStreamMoveAndScaleErr:                    {Code: 400, ErrCode: 10123, Description: "can not move and scale a stream in a single update"},
+		JSStreamMoveInProgress:                     {Code: 400, ErrCode: 10124, Description: "stream move already in progress"},
 		JSStreamMsgDeleteFailedF:                   {Code: 500, ErrCode: 10057, Description: "{err}"},
 		JSStreamNameExistErr:                       {Code: 400, ErrCode: 10058, Description: "stream name already in use"},
 		JSStreamNotFoundErr:                        {Code: 404, ErrCode: 10059, Description: "stream not found"},
@@ -471,7 +495,7 @@ var (
 		JSStreamSequenceNotMatchErr:                {Code: 503, ErrCode: 10063, Description: "expected stream sequence does not match"},
 		JSStreamSnapshotErrF:                       {Code: 500, ErrCode: 10064, Description: "snapshot failed: {err}"},
 		JSStreamStoreFailedF:                       {Code: 503, ErrCode: 10077, Description: "{err}"},
-		JSStreamSubjectOverlapErr:                  {Code: 500, ErrCode: 10065, Description: "subjects overlap with an existing stream"},
+		JSStreamSubjectOverlapErr:                  {Code: 400, ErrCode: 10065, Description: "subjects overlap with an existing stream"},
 		JSStreamTemplateCreateErrF:                 {Code: 500, ErrCode: 10066, Description: "{err}"},
 		JSStreamTemplateDeleteErrF:                 {Code: 500, ErrCode: 10067, Description: "{err}"},
 		JSStreamTemplateNotFoundErr:                {Code: 404, ErrCode: 10068, Description: "template not found"},
@@ -869,6 +893,22 @@ func NewJSConsumerMaxDeliverBackoffError(opts ...ErrorOption) *ApiError {
 	return ApiErrors[JSConsumerMaxDeliverBackoffErr]
 }
 
+// NewJSConsumerMaxPendingAckExcessError creates a new JSConsumerMaxPendingAckExcessErrF error: "consumer max ack pending exceeds system limit of {limit}"
+func NewJSConsumerMaxPendingAckExcessError(limit interface{}, opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	e := ApiErrors[JSConsumerMaxPendingAckExcessErrF]
+	args := e.toReplacerArgs([]interface{}{"{limit}", limit})
+	return &ApiError{
+		Code:        e.Code,
+		ErrCode:     e.ErrCode,
+		Description: strings.NewReplacer(args...).Replace(e.Description),
+	}
+}
+
 // NewJSConsumerMaxPendingAckPolicyRequiredError creates a new JSConsumerMaxPendingAckPolicyRequiredErr error: "consumer requires ack policy for max ack pending"
 func NewJSConsumerMaxPendingAckPolicyRequiredError(opts ...ErrorOption) *ApiError {
 	eopts := parseOpts(opts)
@@ -877,6 +917,22 @@ func NewJSConsumerMaxPendingAckPolicyRequiredError(opts ...ErrorOption) *ApiErro
 	}
 
 	return ApiErrors[JSConsumerMaxPendingAckPolicyRequiredErr]
+}
+
+// NewJSConsumerMaxRequestBatchExceededError creates a new JSConsumerMaxRequestBatchExceededF error: "consumer max request batch exceeds server limit of {limit}"
+func NewJSConsumerMaxRequestBatchExceededError(limit interface{}, opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	e := ApiErrors[JSConsumerMaxRequestBatchExceededF]
+	args := e.toReplacerArgs([]interface{}{"{limit}", limit})
+	return &ApiError{
+		Code:        e.Code,
+		ErrCode:     e.ErrCode,
+		Description: strings.NewReplacer(args...).Replace(e.Description),
+	}
 }
 
 // NewJSConsumerMaxRequestBatchNegativeError creates a new JSConsumerMaxRequestBatchNegativeErr error: "consumer max request batch needs to be > 0"
@@ -1197,7 +1253,7 @@ func NewJSMirrorWithSubjectFiltersError(opts ...ErrorOption) *ApiError {
 	return ApiErrors[JSMirrorWithSubjectFiltersErr]
 }
 
-// NewJSMirrorWithSubjectsError creates a new JSMirrorWithSubjectsErr error: "stream mirrors can not also contain subjects"
+// NewJSMirrorWithSubjectsError creates a new JSMirrorWithSubjectsErr error: "stream mirrors can not contain subjects"
 func NewJSMirrorWithSubjectsError(opts ...ErrorOption) *ApiError {
 	eopts := parseOpts(opts)
 	if ae, ok := eopts.err.(*ApiError); ok {
@@ -1215,6 +1271,16 @@ func NewJSNoAccountError(opts ...ErrorOption) *ApiError {
 	}
 
 	return ApiErrors[JSNoAccountErr]
+}
+
+// NewJSNoLimitsError creates a new JSNoLimitsErr error: "no JetStream default or applicable tiered limit present"
+func NewJSNoLimitsError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSNoLimitsErr]
 }
 
 // NewJSNoMessageFoundError creates a new JSNoMessageFoundErr error: "no message found"
@@ -1545,6 +1611,16 @@ func NewJSStreamMaxBytesRequiredError(opts ...ErrorOption) *ApiError {
 	return ApiErrors[JSStreamMaxBytesRequired]
 }
 
+// NewJSStreamMaxStreamBytesExceededError creates a new JSStreamMaxStreamBytesExceeded error: "stream max bytes exceeds account limit max stream bytes"
+func NewJSStreamMaxStreamBytesExceededError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSStreamMaxStreamBytesExceeded]
+}
+
 // NewJSStreamMessageExceedsMaximumError creates a new JSStreamMessageExceedsMaximumErr error: "message size exceeds maximum allowed"
 func NewJSStreamMessageExceedsMaximumError(opts ...ErrorOption) *ApiError {
 	eopts := parseOpts(opts)
@@ -1555,7 +1631,7 @@ func NewJSStreamMessageExceedsMaximumError(opts ...ErrorOption) *ApiError {
 	return ApiErrors[JSStreamMessageExceedsMaximumErr]
 }
 
-// NewJSStreamMirrorNotUpdatableError creates a new JSStreamMirrorNotUpdatableErr error: "Mirror configuration can not be updated"
+// NewJSStreamMirrorNotUpdatableError creates a new JSStreamMirrorNotUpdatableErr error: "stream mirror configuration can not be updated"
 func NewJSStreamMirrorNotUpdatableError(opts ...ErrorOption) *ApiError {
 	eopts := parseOpts(opts)
 	if ae, ok := eopts.err.(*ApiError); ok {
@@ -1573,6 +1649,26 @@ func NewJSStreamMismatchError(opts ...ErrorOption) *ApiError {
 	}
 
 	return ApiErrors[JSStreamMismatchErr]
+}
+
+// NewJSStreamMoveAndScaleError creates a new JSStreamMoveAndScaleErr error: "can not move and scale a stream in a single update"
+func NewJSStreamMoveAndScaleError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSStreamMoveAndScaleErr]
+}
+
+// NewJSStreamMoveInProgressError creates a new JSStreamMoveInProgress error: "stream move already in progress"
+func NewJSStreamMoveInProgressError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSStreamMoveInProgress]
 }
 
 // NewJSStreamMsgDeleteFailedError creates a new JSStreamMsgDeleteFailedF error: "{err}"
