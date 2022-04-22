@@ -2601,7 +2601,7 @@ func TestJetStreamClusterUserSnapshotAndRestore(t *testing.T) {
 	}
 
 	// Create another consumer as well and give it a non-simplistic state.
-	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "dlc", AckPolicy: nats.AckExplicitPolicy, AckWait: 7500 * time.Millisecond})
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "dlc", AckPolicy: nats.AckExplicitPolicy, AckWait: 10 * time.Second})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -2791,7 +2791,7 @@ func TestJetStreamClusterUserSnapshotAndRestore(t *testing.T) {
 
 	// Check that redelivered come in now..
 	redelivered := 50/3 + 1
-	fetchMsgs(t, jsub, redelivered, 10*time.Second)
+	fetchMsgs(t, jsub, redelivered, 15*time.Second)
 
 	// Now make sure the other server was properly caughtup.
 	// Need to call this by hand for now.
@@ -12142,66 +12142,79 @@ func TestJetStreamClusterMovingStreamAndMoveBack(t *testing.T) {
 	nc, js := jsClientConnect(t, sc.randomServer())
 	defer nc.Close()
 
-	_, err := js.AddStream(&nats.StreamConfig{
-		Name:      "TEST",
-		Replicas:  3,
-		Placement: &nats.Placement{Tags: []string{"cloud:aws"}},
-	})
-	require_NoError(t, err)
+	for _, test := range []struct {
+		name     string
+		replicas int
+	}{
+		{"R1", 1},
+		{"R3", 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			js.DeleteStream("TEST")
 
-	for i := 0; i < 1000; i++ {
-		_, err := js.PublishAsync("TEST", []byte("HELLO WORLD"))
-		require_NoError(t, err)
-	}
-	select {
-	case <-js.PublishAsyncComplete():
-	case <-time.After(5 * time.Second):
-		t.Fatalf("Did not receive completion signal")
-	}
+			_, err := js.AddStream(&nats.StreamConfig{
+				Name:      "TEST",
+				Replicas:  test.replicas,
+				Placement: &nats.Placement{Tags: []string{"cloud:aws"}},
+			})
+			require_NoError(t, err)
 
-	_, err = js.UpdateStream(&nats.StreamConfig{
-		Name:      "TEST",
-		Replicas:  3,
-		Placement: &nats.Placement{Tags: []string{"cloud:gcp"}},
-	})
-	require_NoError(t, err)
+			toSend := 10_000
+			for i := 0; i < toSend; i++ {
+				_, err := js.PublishAsync("TEST", []byte("HELLO WORLD"))
+				require_NoError(t, err)
+			}
+			select {
+			case <-js.PublishAsyncComplete():
+			case <-time.After(5 * time.Second):
+				t.Fatalf("Did not receive completion signal")
+			}
 
-	checkMove := func(cluster string) {
-		t.Helper()
-		checkFor(t, 30*time.Second, 100*time.Millisecond, func() error {
-			si, err := js.StreamInfo("TEST")
-			if err != nil {
-				return err
+			_, err = js.UpdateStream(&nats.StreamConfig{
+				Name:      "TEST",
+				Replicas:  test.replicas,
+				Placement: &nats.Placement{Tags: []string{"cloud:gcp"}},
+			})
+			require_NoError(t, err)
+
+			checkMove := func(cluster string) {
+				t.Helper()
+				checkFor(t, 20*time.Second, 100*time.Millisecond, func() error {
+					si, err := js.StreamInfo("TEST")
+					if err != nil {
+						return err
+					}
+					if si.Cluster.Name != cluster {
+						return fmt.Errorf("Wrong cluster: %q", si.Cluster.Name)
+					}
+					if si.Cluster.Leader == _EMPTY_ {
+						return fmt.Errorf("No leader yet")
+					} else if !strings.HasPrefix(si.Cluster.Leader, cluster) {
+						return fmt.Errorf("Wrong leader: %q", si.Cluster.Leader)
+					}
+					// Now we want to see that we shrink back to original.
+					if len(si.Cluster.Replicas) != test.replicas-1 {
+						return fmt.Errorf("Expected %d replicas, got %d", test.replicas-1, len(si.Cluster.Replicas))
+					}
+					if si.State.Msgs != uint64(toSend) {
+						return fmt.Errorf("Only see %d msgs", si.State.Msgs)
+					}
+					return nil
+				})
 			}
-			if si.Cluster.Name != cluster {
-				return fmt.Errorf("Wrong cluster: %q", si.Cluster.Name)
-			}
-			if si.Cluster.Leader == _EMPTY_ {
-				return fmt.Errorf("No leader yet")
-			} else if !strings.HasPrefix(si.Cluster.Leader, cluster) {
-				return fmt.Errorf("Wrong leader: %q", si.Cluster.Leader)
-			}
-			// Now we want to see that we shrink back to original.
-			if len(si.Cluster.Replicas) != 2 {
-				return fmt.Errorf("Expected %d replicas, got %d", 2, len(si.Cluster.Replicas))
-			}
-			if si.State.Msgs != 1000 {
-				return fmt.Errorf("Only see %d msgs", si.State.Msgs)
-			}
-			return nil
+
+			checkMove("C2")
+
+			_, err = js.UpdateStream(&nats.StreamConfig{
+				Name:      "TEST",
+				Replicas:  test.replicas,
+				Placement: &nats.Placement{Tags: []string{"cloud:aws"}},
+			})
+			require_NoError(t, err)
+
+			checkMove("C1")
 		})
 	}
-
-	checkMove("C2")
-
-	_, err = js.UpdateStream(&nats.StreamConfig{
-		Name:      "TEST",
-		Replicas:  3,
-		Placement: &nats.Placement{Tags: []string{"cloud:aws"}},
-	})
-	require_NoError(t, err)
-
-	checkMove("C1")
 }
 
 func TestJetStreamClusterMemoryConsumerInterestRetention(t *testing.T) {
@@ -12309,7 +12322,10 @@ func TestJetStreamClusterImportConsumerStreamSubjectRemap(t *testing.T) {
 		IM: {
 			users: [ {user: im, password: pwd} ]
 			imports [
-				{ stream:  { account: JS, subject: "deliver.ORDERS.*" }}
+				{ stream:  { account: JS, subject: "deliver.ORDERS.route" }}
+				{ stream:  { account: JS, subject: "deliver.ORDERS.gateway" }}
+				{ stream:  { account: JS, subject: "deliver.ORDERS.leaf1" }}
+				{ stream:  { account: JS, subject: "deliver.ORDERS.leaf2" }}
 				{ service: {account: JS, subject: "$JS.FC.>" }}
 			]
 		},
@@ -12319,83 +12335,93 @@ func TestJetStreamClusterImportConsumerStreamSubjectRemap(t *testing.T) {
 		listen: 127.0.0.1:-1
 	}`
 
-	c := createJetStreamSuperClusterWithTemplate(t, template, 3, 2)
-	defer c.shutdown()
+	test := func(t *testing.T, queue bool) {
+		c := createJetStreamSuperClusterWithTemplate(t, template, 3, 2)
+		defer c.shutdown()
 
-	s := c.randomServer()
-	nc, js := jsClientConnect(t, s, nats.UserInfo("js", "pwd"))
-	defer nc.Close()
+		s := c.randomServer()
+		nc, js := jsClientConnect(t, s, nats.UserInfo("js", "pwd"))
+		defer nc.Close()
 
-	_, err := js.AddStream(&nats.StreamConfig{
-		Name:      "ORDERS",
-		Subjects:  []string{"foo"}, // The JS subject.
-		Replicas:  3,
-		Placement: &nats.Placement{Cluster: "C1"},
-	})
-	require_NoError(t, err)
-
-	_, err = js.Publish("foo", []byte("OK"))
-	require_NoError(t, err)
-
-	for dur, deliver := range map[string]string{
-		"dur-route":   "deliver.ORDERS.route",
-		"dur-gateway": "deliver.ORDERS.gateway",
-		"dur-leaf-1":  "deliver.ORDERS.leaf1",
-		"dur-leaf-2":  "deliver.ORDERS.leaf2",
-	} {
-		_, err = js.AddConsumer("ORDERS", &nats.ConsumerConfig{
-			Durable:        dur,
-			DeliverSubject: deliver,
-			AckPolicy:      nats.AckExplicitPolicy,
+		_, err := js.AddStream(&nats.StreamConfig{
+			Name:      "ORDERS",
+			Subjects:  []string{"foo"}, // The JS subject.
+			Replicas:  3,
+			Placement: &nats.Placement{Cluster: "C1"},
 		})
 		require_NoError(t, err)
-	}
 
-	test := func(t *testing.T, s *Server, dSubj string) {
-		nc2, err := nats.Connect(s.ClientURL(), nats.UserInfo("im", "pwd"))
-		require_NoError(t, err)
-		defer nc2.Close()
-
-		sub, err := nc2.SubscribeSync(dSubj)
+		_, err = js.Publish("foo", []byte("OK"))
 		require_NoError(t, err)
 
-		m, err := sub.NextMsg(time.Second)
-		require_NoError(t, err)
-
-		if m.Subject != "foo" {
-			t.Fatalf("Subject not mapped correctly across account boundary, expected %q got %q", "foo", m.Subject)
+		for dur, deliver := range map[string]string{
+			"dur-route":   "deliver.ORDERS.route",
+			"dur-gateway": "deliver.ORDERS.gateway",
+			"dur-leaf-1":  "deliver.ORDERS.leaf1",
+			"dur-leaf-2":  "deliver.ORDERS.leaf2",
+		} {
+			cfg := &nats.ConsumerConfig{
+				Durable:        dur,
+				DeliverSubject: deliver,
+				AckPolicy:      nats.AckExplicitPolicy,
+			}
+			if queue {
+				cfg.DeliverGroup = "queue"
+			}
+			_, err = js.AddConsumer("ORDERS", cfg)
+			require_NoError(t, err)
 		}
-		require_False(t, strings.Contains(m.Reply, "@"))
-	}
 
-	t.Run("route", func(t *testing.T) {
-		// pick random non consumer leader so we receive via route
-		s := c.clusterForName("C1").randomNonConsumerLeader("JS", "ORDERS", "dur-route")
-		test(t, s, "deliver.ORDERS.route")
-	})
-	t.Run("gateway", func(t *testing.T) {
-		// pick server with inbound gateway from consumer leader, so we receive from gateway and have no route in between
-		scl := c.clusterForName("C1").consumerLeader("JS", "ORDERS", "dur-gateway")
-		var sfound *Server
-		for _, s := range c.clusterForName("C2").servers {
-			s.mu.Lock()
-			for _, c := range s.gateway.in {
-				if c.GetName() == scl.info.ID {
-					sfound = s
+		testCase := func(t *testing.T, s *Server, dSubj string) {
+			nc2, err := nats.Connect(s.ClientURL(), nats.UserInfo("im", "pwd"))
+			require_NoError(t, err)
+			defer nc2.Close()
+
+			var sub *nats.Subscription
+			if queue {
+				sub, err = nc2.QueueSubscribeSync(dSubj, "queue")
+			} else {
+				sub, err = nc2.SubscribeSync(dSubj)
+			}
+			require_NoError(t, err)
+
+			m, err := sub.NextMsg(time.Second)
+			require_NoError(t, err)
+
+			if m.Subject != "foo" {
+				t.Fatalf("Subject not mapped correctly across account boundary, expected %q got %q", "foo", m.Subject)
+			}
+			require_False(t, strings.Contains(m.Reply, "@"))
+		}
+
+		t.Run("route", func(t *testing.T) {
+			// pick random non consumer leader so we receive via route
+			s := c.clusterForName("C1").randomNonConsumerLeader("JS", "ORDERS", "dur-route")
+			testCase(t, s, "deliver.ORDERS.route")
+		})
+		t.Run("gateway", func(t *testing.T) {
+			// pick server with inbound gateway from consumer leader, so we receive from gateway and have no route in between
+			scl := c.clusterForName("C1").consumerLeader("JS", "ORDERS", "dur-gateway")
+			var sfound *Server
+			for _, s := range c.clusterForName("C2").servers {
+				s.mu.Lock()
+				for _, c := range s.gateway.in {
+					if c.GetName() == scl.info.ID {
+						sfound = s
+						break
+					}
+				}
+				s.mu.Unlock()
+				if sfound != nil {
 					break
 				}
 			}
-			s.mu.Unlock()
-			if sfound != nil {
-				break
-			}
-		}
-		test(t, sfound, "deliver.ORDERS.gateway")
-	})
-	t.Run("leaf-post-export", func(t *testing.T) {
-		// create leaf node server connected post export/import
-		scl := c.clusterForName("C1").consumerLeader("JS", "ORDERS", "dur-leaf-1")
-		cf := createConfFile(t, []byte(fmt.Sprintf(`
+			testCase(t, sfound, "deliver.ORDERS.gateway")
+		})
+		t.Run("leaf-post-export", func(t *testing.T) {
+			// create leaf node server connected post export/import
+			scl := c.clusterForName("C1").consumerLeader("JS", "ORDERS", "dur-leaf-1")
+			cf := createConfFile(t, []byte(fmt.Sprintf(`
 			port: -1
 			leafnodes {
 				remotes [ { url: "nats://im:pwd@127.0.0.1:%d" } ]
@@ -12405,26 +12431,26 @@ func TestJetStreamClusterImportConsumerStreamSubjectRemap(t *testing.T) {
 				password: pwd
 			}
 		`, scl.getOpts().LeafNode.Port)))
-		defer removeFile(t, cf)
-		s, _ := RunServerWithConfig(cf)
-		defer s.Shutdown()
-		checkLeafNodeConnected(t, scl)
-		test(t, s, "deliver.ORDERS.leaf1")
-	})
-	t.Run("leaf-pre-export", func(t *testing.T) {
-		// create leaf node server connected pre export, perform export/import on leaf node server
-		scl := c.clusterForName("C1").consumerLeader("JS", "ORDERS", "dur-leaf-2")
-		cf := createConfFile(t, []byte(fmt.Sprintf(`
+			defer removeFile(t, cf)
+			s, _ := RunServerWithConfig(cf)
+			defer s.Shutdown()
+			checkLeafNodeConnected(t, scl)
+			testCase(t, s, "deliver.ORDERS.leaf1")
+		})
+		t.Run("leaf-pre-export", func(t *testing.T) {
+			// create leaf node server connected pre export, perform export/import on leaf node server
+			scl := c.clusterForName("C1").consumerLeader("JS", "ORDERS", "dur-leaf-2")
+			cf := createConfFile(t, []byte(fmt.Sprintf(`
 			port: -1
 			leafnodes {
-				remotes [ { url: "nats://im:pwd@127.0.0.1:%d", account: JS2 } ]
+				remotes [ { url: "nats://js:pwd@127.0.0.1:%d", account: JS2 } ]
 			}
 			accounts: {
 				JS2: {
 					users: [ {user: js, password: pwd} ]
 					exports [
 						# This is streaming to a delivery subject for a push based consumer.
-						{ stream: "deliver.ORDERS.*" }
+						{ stream: "deliver.ORDERS.leaf2" }
 						# This is to ack received messages. This is a service to support sync ack.
 						{ service: "$JS.ACK.ORDERS.*.>" }
 						# To support ordered consumers, flow control.
@@ -12434,17 +12460,25 @@ func TestJetStreamClusterImportConsumerStreamSubjectRemap(t *testing.T) {
 				IM2: {
 					users: [ {user: im, password: pwd} ]
 					imports [
-						{ stream:  { account: JS2, subject: "deliver.ORDERS.*" }}
+						{ stream:  { account: JS2, subject: "deliver.ORDERS.leaf2" }}
 						{ service: {account: JS2, subject: "$JS.FC.>" }}
 					]
 				},
 			}
 		`, scl.getOpts().LeafNode.Port)))
-		defer removeFile(t, cf)
-		s, _ := RunServerWithConfig(cf)
-		defer s.Shutdown()
-		checkLeafNodeConnected(t, scl)
-		test(t, s, "deliver.ORDERS.leaf2")
+			defer removeFile(t, cf)
+			s, _ := RunServerWithConfig(cf)
+			defer s.Shutdown()
+			checkLeafNodeConnected(t, scl)
+			testCase(t, s, "deliver.ORDERS.leaf2")
+		})
+	}
+
+	t.Run("noQueue", func(t *testing.T) {
+		test(t, false)
+	})
+	t.Run("queue", func(t *testing.T) {
+		test(t, true)
 	})
 }
 
@@ -14040,4 +14074,90 @@ func TestJetStreamMirrorSourceLoop(t *testing.T) {
 		defer c.shutdown()
 		test(t, c.randomServer(), 2)
 	})
+}
+
+func TestJetStreamClusterMirrorDeDupWindow(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "JSC", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	si, err := js.AddStream(&nats.StreamConfig{
+		Name:     "S",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+	require_True(t, si.Cluster != nil)
+	require_True(t, si.Config.Replicas == 3)
+	require_True(t, len(si.Cluster.Replicas) == 2)
+
+	send := func(count int) {
+		t.Helper()
+		for i := 0; i < count; i++ {
+			_, err := js.Publish("foo", []byte("msg"))
+			require_NoError(t, err)
+		}
+	}
+
+	// Send 100 messages
+	send(100)
+
+	// First check that we can't create with a duplicates window
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:       "M",
+		Replicas:   3,
+		Mirror:     &nats.StreamSource{Name: "S"},
+		Duplicates: time.Hour,
+	})
+	require_Error(t, err)
+
+	// Now create a valid one.
+	si, err = js.AddStream(&nats.StreamConfig{
+		Name:     "M",
+		Replicas: 3,
+		Mirror:   &nats.StreamSource{Name: "S"},
+	})
+	require_NoError(t, err)
+	require_True(t, si.Cluster != nil)
+	require_True(t, si.Config.Replicas == 3)
+	require_True(t, len(si.Cluster.Replicas) == 2)
+
+	check := func(expected int) {
+		t.Helper()
+		// Wait for all messages to be in mirror
+		checkFor(t, 15*time.Second, 50*time.Millisecond, func() error {
+			si, err := js.StreamInfo("M")
+			if err != nil {
+				return err
+			}
+			if n := si.State.Msgs; int(n) != expected {
+				return fmt.Errorf("Expected %v msgs, got %v", expected, n)
+			}
+			return nil
+		})
+	}
+	check(100)
+
+	// Restart cluster
+	nc.Close()
+	c.stopAll()
+	c.restartAll()
+	c.waitOnLeader()
+	c.waitOnStreamLeader(globalAccountName, "S")
+	c.waitOnStreamLeader(globalAccountName, "M")
+
+	nc, js = jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	si, err = js.StreamInfo("M")
+	require_NoError(t, err)
+	require_True(t, si.Cluster != nil)
+	require_True(t, si.Config.Replicas == 3)
+	require_True(t, len(si.Cluster.Replicas) == 2)
+
+	// Send 100 messages
+	send(100)
+	check(200)
 }

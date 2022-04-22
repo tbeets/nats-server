@@ -3332,7 +3332,7 @@ func TestJetStreamPublishDeDupe(t *testing.T) {
 	expect(4)
 
 	cfg = mset.config()
-	cfg.Duplicates = 25 * time.Millisecond
+	cfg.Duplicates = 100 * time.Millisecond
 	if err := mset.update(&cfg); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -8782,12 +8782,12 @@ func TestJetStreamUpdateStream(t *testing.T) {
 
 			// Now do age.
 			cfg = *c.mconfig
-			cfg.MaxAge = time.Millisecond
+			cfg.MaxAge = 100 * time.Millisecond
 			if err := mset.update(&cfg); err != nil {
 				t.Fatalf("Unexpected error %v", err)
 			}
 			// Just wait a bit for expiration.
-			time.Sleep(25 * time.Millisecond)
+			time.Sleep(200 * time.Millisecond)
 			if mset.config().MaxAge != cfg.MaxAge {
 				t.Fatalf("Expected the change to take effect, %d vs %d", mset.config().MaxAge, cfg.MaxAge)
 			}
@@ -16233,12 +16233,20 @@ func TestJetStreamRemoveExternalSource(t *testing.T) {
 	_, err = jsa.AddStream(&nats.StreamConfig{Name: "queue", Subjects: []string{"queue"}})
 	require_NoError(t, err)
 
+	_, err = jsa.AddStream(&nats.StreamConfig{Name: "testdel", Subjects: []string{"testdel"}})
+	require_NoError(t, err)
+
 	ncb, jsb := jsClientConnect(t, l2)
 	defer ncb.Close()
 	_, err = jsb.AddStream(&nats.StreamConfig{Name: "test", Subjects: []string{"test"}})
 	require_NoError(t, err)
 	sendToStreamTest(jsb)
 	checkStreamMsgs(jsb, "test", 10)
+
+	_, err = jsb.AddStream(&nats.StreamConfig{Name: "testdelsrc1", Subjects: []string{"testdelsrc1"}})
+	require_NoError(t, err)
+	_, err = jsb.AddStream(&nats.StreamConfig{Name: "testdelsrc2", Subjects: []string{"testdelsrc2"}})
+	require_NoError(t, err)
 
 	// Add test as source to queue
 	si, err := jsa.UpdateStream(&nats.StreamConfig{
@@ -16282,6 +16290,54 @@ func TestJetStreamRemoveExternalSource(t *testing.T) {
 	// incorrectly happen if there is a bug.
 	time.Sleep(250 * time.Millisecond)
 	checkStreamMsgs(jsa, "queue", 20)
+
+	// Test that we delete correctly. First add source to a "testdel"
+	si, err = jsa.UpdateStream(&nats.StreamConfig{
+		Name:     "testdel",
+		Subjects: []string{"testdel"},
+		Sources: []*nats.StreamSource{
+			{
+				Name: "testdelsrc1",
+				External: &nats.ExternalStream{
+					APIPrefix: "$JS.b-leaf.API",
+				},
+			},
+		},
+	})
+	require_NoError(t, err)
+	require_True(t, len(si.Config.Sources) == 1)
+	// Now add the second one...
+	si, err = jsa.UpdateStream(&nats.StreamConfig{
+		Name:     "testdel",
+		Subjects: []string{"testdel"},
+		Sources: []*nats.StreamSource{
+			{
+				Name: "testdelsrc1",
+				External: &nats.ExternalStream{
+					APIPrefix: "$JS.b-leaf.API",
+				},
+			},
+			{
+				Name: "testdelsrc2",
+				External: &nats.ExternalStream{
+					APIPrefix: "$JS.b-leaf.API",
+				},
+			},
+		},
+	})
+	require_NoError(t, err)
+	require_True(t, len(si.Config.Sources) == 2)
+	// Now check that the stream testdel has still 2 source consumers...
+	acc, err := l1.lookupAccount(globalAccountName)
+	require_NoError(t, err)
+	mset, err := acc.lookupStream("testdel")
+	require_NoError(t, err)
+	mset.mu.RLock()
+	n := len(mset.sources)
+	mset.mu.RUnlock()
+	if n != 2 {
+		t.Fatalf("Expected 2 sources, got %v", n)
+	}
 
 	// Restart leaf "a"
 	nca.Close()
@@ -16965,43 +17021,64 @@ func TestJetStreamImportConsumerStreamSubjectRemapSingle(t *testing.T) {
 	`))
 	defer removeFile(t, conf)
 
-	s, _ := RunServerWithConfig(conf)
-	if config := s.JetStreamConfig(); config != nil {
-		defer removeDir(t, config.StoreDir)
+	test := func(t *testing.T, queue bool) {
+		s, _ := RunServerWithConfig(conf)
+		if config := s.JetStreamConfig(); config != nil {
+			defer removeDir(t, config.StoreDir)
+		}
+		defer s.Shutdown()
+
+		nc, js := jsClientConnect(t, s, nats.UserInfo("js", "pwd"))
+		defer nc.Close()
+
+		_, err := js.AddStream(&nats.StreamConfig{
+			Name:     "ORDERS",
+			Subjects: []string{"foo"}, // The JS subject.
+			Storage:  nats.MemoryStorage},
+		)
+		require_NoError(t, err)
+
+		_, err = js.Publish("foo", []byte("OK"))
+		require_NoError(t, err)
+
+		queueName := ""
+		if queue {
+			queueName = "queue"
+		}
+
+		_, err = js.AddConsumer("ORDERS", &nats.ConsumerConfig{
+			DeliverSubject: "deliver.ORDERS",
+			AckPolicy:      nats.AckExplicitPolicy,
+			DeliverGroup:   queueName,
+		})
+		require_NoError(t, err)
+
+		nc2, err := nats.Connect(s.ClientURL(), nats.UserInfo("im", "pwd"))
+		require_NoError(t, err)
+
+		var sub *nats.Subscription
+		if queue {
+			sub, err = nc2.QueueSubscribeSync("d", queueName)
+			require_NoError(t, err)
+		} else {
+			sub, err = nc2.SubscribeSync("d")
+			require_NoError(t, err)
+		}
+
+		m, err := sub.NextMsg(time.Second)
+		require_NoError(t, err)
+
+		if m.Subject != "foo" {
+			t.Fatalf("Subject not mapped correctly across account boundary, expected %q got %q", "foo", m.Subject)
+		}
 	}
-	defer s.Shutdown()
 
-	nc, js := jsClientConnect(t, s, nats.UserInfo("js", "pwd"))
-	defer nc.Close()
-
-	_, err := js.AddStream(&nats.StreamConfig{
-		Name:     "ORDERS",
-		Subjects: []string{"foo"}, // The JS subject.
-		Storage:  nats.MemoryStorage},
-	)
-	require_NoError(t, err)
-
-	_, err = js.Publish("foo", []byte("OK"))
-	require_NoError(t, err)
-
-	_, err = js.AddConsumer("ORDERS", &nats.ConsumerConfig{
-		DeliverSubject: "deliver.ORDERS",
-		AckPolicy:      nats.AckExplicitPolicy,
+	t.Run("noqueue", func(t *testing.T) {
+		test(t, false)
 	})
-	require_NoError(t, err)
-
-	nc2, err := nats.Connect(s.ClientURL(), nats.UserInfo("im", "pwd"))
-	require_NoError(t, err)
-
-	sub, err := nc2.SubscribeSync("d")
-	require_NoError(t, err)
-
-	m, err := sub.NextMsg(time.Second)
-	require_NoError(t, err)
-
-	if m.Subject != "foo" {
-		t.Fatalf("Subject not mapped correctly across account boundary, expected %q got %q", "foo", m.Subject)
-	}
+	t.Run("queue", func(t *testing.T) {
+		test(t, true)
+	})
 }
 
 ///////////////////////////////////////////////////////////////////////////
